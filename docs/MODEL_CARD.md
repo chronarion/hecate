@@ -37,10 +37,10 @@ GGUF or safetensors checkpoint.
 
 | Folder | Contents | Size |
 |---|---|---|
-| `base/` | config, tokenizer, chat template; unquantized tensors (embeddings, norms, router, DSA indexer, kv_b_proj, MTP norms); `virtual.json` (shapes of EXL3 tensors the runtime never loads) | ~4.7 GB |
+| `base/` | config, tokenizer, chat template; unquantized tensors (embeddings, norms, router, DSA indexer, kv_b_proj, MTP norms and eh_proj); `virtual.json` (shapes of EXL3 tensors the runtime never loads) | ~4.7 GB |
 | `int4/` | routed experts of the hot tier (144 per layer, GB300 HBM) and the cold tier (27 per layer, Grace), plus all 256 experts of the MTP layer: uniform int4 with a per-row scale, GPTQ with causal state propagation, packed in the moe4 kernel's fragment order | ~247 GB |
 | `rtx-band/` | the warm tier (85 experts per layer) as 3-bit EXL3 trellis (mul1 codebook), requantized from BF16 with the same calibration | ~91 GB |
-| `int8/` | attention projections, shared experts, dense MLPs, LM head, MTP eh_proj: int8 with a per-row MSE-clipped scale, in the cluster GEMV's fragment order | ~17 GB |
+| `int8/` | attention projections, shared experts, dense MLPs, LM head: int8 with a per-row MSE-clipped scale, in the cluster GEMV's fragment order | ~17 GB |
 | `placement/` | per-layer expert permutations by routing popularity (default and larger-KV profiles) | small |
 
 ## How it was made
