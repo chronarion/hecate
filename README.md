@@ -57,7 +57,8 @@ credits public work the change builds on; "—" means it came out of profiling t
 **Fidelity.** These changes made the model closer to BF16 than the published 3-bit quant, not just faster:
 - the int4 tiers are GPTQ-requantized from BF16, calibrated on the states of the quantized model, layer by layer;
 - the warm RTX tier is requantized from BF16 the same way;
-- every non-expert linear is int8 straight from BF16.
+- the attention projections, shared experts, dense MLPs and LM head are int8 straight from BF16; the router, DSA
+  indexer, kv_b_proj and the MTP eh_proj stay FP16.
 
 KLD is 0.0740, against 0.1013 for the published EXL3 3.0 bpw on the same windows.
 
