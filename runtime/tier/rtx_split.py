@@ -1,6 +1,6 @@
 """RTX PRO 6000 as a per-layer expert co-processor for GLM-5.3 EXL3 (hecate; runtime patch imported before the model loads).
 
-Placement (EXL3_RTX_SPLIT = json from placement.py): per main MoE layer, the routed experts are permuted so the GB300's set
+Placement (EXL3_RTX_SPLIT = json from tools/placement/tier_placement.py): per main MoE layer, the routed experts are permuted so the GB300's set
 is [0, first) and the RTX's band is [first, 256). The GB300 module is shrunk to its slice exactly like ExLlamaV3's CPU split
 (the kernels mask the tail; cpu_post_load permutes the router to match); the tail experts load straight onto the RTX.
 

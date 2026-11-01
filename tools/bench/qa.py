@@ -1,4 +1,5 @@
-"""Known-answer QA against the EXL3 TabbyAPI server (:8103), same 6 questions as glm-nll.py."""
+"""Known-answer QA against the Hecate server (:8103): 6 questions with one known answer each, greedy.
+   python3 -I qa.py"""
 import json, urllib.request
 URL = "http://127.0.0.1:8103/v1"
 model = json.load(urllib.request.urlopen(f"{URL}/models"))["data"][0]["id"]

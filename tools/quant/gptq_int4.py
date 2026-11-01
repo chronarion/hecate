@@ -6,12 +6,12 @@ Per module, two state streams run through the BF16 weights:
   Q = the calibration corpus (calib.json, disjoint), propagated through the *quantized* experts: every MoE layer is
       calibrated on the states the int4 model actually produces up to that layer (causal correction).
 Per MoE layer L (experts of the int4 bands: placement perm[:144] hot -> layer{L}.safetensors, perm[144:171] cold ->
-layer{L}.r229.safetensors, same format as requant_u4.py: uniform int4 per-row MSE-best scale, moe4 fragment order):
+layer{L}.r229.safetensors; uniform int4 with a per-row MSE-best scale, in the moe4 fragment order):
   1. capture the MoE input of every Q token and its routing (the layer's MoE is skipped in this pass)
   2. per expert H = X^T X over the tokens routed to it; batched act-order GPTQ of gate and up (shared H)
   3. down calibrated on the reconstructed (quantized) gate/up output: H_down = A^T A, A = silu(X Gq^T) * (X Uq^T); GPTQ
   4. write the files; copy the dequantized int4 weights into the module; run the layer on Q -> next layer's Q states
-   python -I kld_gptq.py --a /kbf16 --corpus C --calib Q --ref REF --out OUT --stage STAGE --u4out U4 --place P [--smoke]"""
+   python -I gptq_int4.py --a /kbf16 --corpus C --calib Q --ref REF --out OUT --stage STAGE --u4out U4 --place P [--smoke]"""
 import sys, os, json, time, argparse
 import torch
 import torch.nn.functional as F
@@ -201,7 +201,7 @@ def requant_layer(mlp, L, Z, SEL, EV, CH=64, RHO=0.3, NMIN=4096):
         set_expert_weights(mlp, ex, "downs", Wdq.half()); del Wq, Wdq
         Qgu.append(q_); sgu.append(s_); Qd.append(qd_); sd.append(sd_)
     Qgu = torch.cat(Qgu); sgu = torch.cat(sgu); Qd = torch.cat(Qd); sd = torch.cat(sd); del Sig, Zp
-    # files (same layout as requant_u4.py) and the module copy for the Q propagation
+    # files (moe4 layout) and the module copy for the Q propagation
     hot, cold = {}, {}
     for i, e in enumerate(experts):
         dst = hot if i < NHOT else cold

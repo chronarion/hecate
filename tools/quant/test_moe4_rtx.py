@@ -1,5 +1,5 @@
 """moe4 built for sm_120a (RTX) vs sm_103a (GB300) vs a torch fp32 reference on real far-band int4 experts of one layer.
-Run in the served image with both GPUs: python3 r4test.py LAYER K"""
+Run in the served image with both GPUs: python3 test_moe4_rtx.py LAYER K"""
 import json, os, sys, torch
 from safetensors import safe_open
 from torch.utils.cpp_extension import load

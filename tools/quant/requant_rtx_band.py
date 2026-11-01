@@ -2,9 +2,9 @@
 EXL3 trellis from stock zai-org/GLM-5.3-BF16, so the whole served model is stock lineage.
 
 One streaming pass over the BF16 model (stage.py fetches module i, this script loads it after STAGE/ready.i):
-  - a calibration stream (calib2.json, the GPTQ v2 corpus) runs through the model as it is served: per MoE layer the int4
-    bands (hot 144 + cold 27) are set to their dequantized GPTQ v2 weights, the RTX band to its new trellis weights, so
-    each layer is calibrated on the states the served model actually produces (causal correction, as in kld_gptq.py);
+  - a calibration stream (calib2.json, the int4 GPTQ calibration corpus) runs through the model as it is served: per MoE layer the int4
+    bands (hot 144 + cold 27) are set to their dequantized GPTQ weights, the RTX band to its new trellis weights, so
+    each layer is calibrated on the states the served model actually produces (causal correction, as in gptq_int4.py);
   - per RTX-band expert: H = X^T X over its routed tokens, shrunk toward the layer-wide input covariance (rho 0.3, prior
     weight max(n, 4096)); gate and up quantized with that H, down with the Hessian of the *quantized* gate/up output;
     ExLlamaV3's own quantizer (quantize_exl3_batch: LDLQ trellis, K 3, mul1 codebook, output scales always), i.e. the

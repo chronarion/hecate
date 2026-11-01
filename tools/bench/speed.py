@@ -1,5 +1,6 @@
-"""EXL3 MTP A/B over 10 prompts (acceptance varies with the text; the mean over many prompts is the comparison):
-   python3 -I exl3-speedmany.py LABEL"""
+"""Decode speed over 10 fixed prompts, greedy, 400 tokens (MTP acceptance varies with the text; the mean over the prompts
+is the comparison):
+   python3 -I speed.py LABEL"""
 import json, sys, urllib.request, statistics
 URL = "http://127.0.0.1:8103/v1"
 model = json.load(urllib.request.urlopen(f"{URL}/models"))["data"][0]["id"]
