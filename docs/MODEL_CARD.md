@@ -1,7 +1,7 @@
 ---
 license: other
 license_name: glm-5.3
-license_link: base/LICENSE
+license_link: https://huggingface.co/zai-org/GLM-5.3-BF16/blob/main/LICENSE
 base_model: zai-org/GLM-5.3-BF16
 base_model_relation: quantized
 library_name: exllamav3
