@@ -2,7 +2,7 @@
 license: other
 license_name: glm-5.3
 license_link: base/LICENSE
-base_model: zai-org/GLM-5.3
+base_model: zai-org/GLM-5.3-BF16
 base_model_relation: quantized
 library_name: exllamav3
 pipeline_tag: text-generation
@@ -25,7 +25,7 @@ the Grace CPU each serve a tier of experts. Served by [Hecate](https://github.co
 (ExLlamaV3 + TabbyAPI + custom kernels). The files are only usable with that runtime: they are not a standard EXL3,
 GGUF or safetensors checkpoint.
 
-**Every tensor derives from stock [zai-org/GLM-5.3](https://huggingface.co/zai-org/GLM-5.3) BF16.**
+**Every tensor derives from the stock BF16 release, [zai-org/GLM-5.3-BF16](https://huggingface.co/zai-org/GLM-5.3-BF16).**
 
 | | |
 |---|---|

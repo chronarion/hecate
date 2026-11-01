@@ -14,8 +14,8 @@ Each tier uses the weight format and kernel that suit its hardware. Hecate is bu
 [ExLlamaV3](https://github.com/turboderp-org/exllamav3) and [TabbyAPI](https://github.com/theroyallab/tabbyAPI): it is
 a set of kernels, runtime modules and patches, and the result is an OpenAI-compatible server in one container.
 
-Weights: [chronarion/GLM-5.3-Hecate](https://huggingface.co/chronarion/GLM-5.3-Hecate), derived from stock
-zai-org/GLM-5.3 only.
+Weights: [chronarion/GLM-5.3-Hecate](https://huggingface.co/chronarion/GLM-5.3-Hecate), derived only from the stock BF16
+release, [zai-org/GLM-5.3-BF16](https://huggingface.co/zai-org/GLM-5.3-BF16).
 
 ## Results (DGX Station GB300, driver 615, CUDA 13)
 
