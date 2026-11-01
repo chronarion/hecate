@@ -1,7 +1,8 @@
 """Regenerate runtime/patched/{generator,async_generator}.py from ExLlamaV3's own files (rerun after an ExLlamaV3 update;
 every replacement is asserted, so a changed upstream file fails loudly instead of silently mis-patching):
   generator.py        decode share while a prompt is ingested (EXL3_PREFILL_DECODE_SHARE), MTP gap merge
-                      (EXL3_MTP_MERGE_GAP), hook for the draft-loop CUDA graph (EXL3_DRAFT_GRAPH)
+                      (EXL3_MTP_MERGE_GAP), hook for the draft-loop CUDA graph (EXL3_DRAFT_GRAPH), and the pipelined
+                      MTP decode step (EXL3_PRELAUNCH, prelaunch_patch.py)
   async_generator.py  yield to the event loop after long steps, so requests arriving mid-prefill are admitted
    python3 make_patches.py IMAGE_FILES_DIR OUT_DIR   (IMAGE_FILES_DIR: exllamav3/generator/ of the built image)"""
 import sys, os
@@ -142,3 +143,8 @@ patch("async_generator.py", [
     ("class AsyncGenerator", "_LONG_STEP = float(_os.environ.get(\"EXL3_LONG_STEP_S\", \"0.2\"))\n"
      "_LONG_YIELD = float(_os.environ.get(\"EXL3_LONG_STEP_YIELD_S\", \"0.02\"))\n\n\nclass AsyncGenerator"),
 ])
+
+# pipelined MTP decode step (EXL3_PRELAUNCH), on top of the generator patches above
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import prelaunch_patch  # noqa: E402
+prelaunch_patch.apply(f"{out}/generator.py")

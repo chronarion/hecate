@@ -41,6 +41,9 @@ from ..util import profile_opt
 # (launch-all-samplers, one pinned stage, one synchronize) path
 _NO_BATCH_READBACK = False
 
+_PRELAUNCH = os.environ.get("EXL3_PRELAUNCH", "1") == "1"   # hecate: pipelined MTP decode step
+
+
 class Generator:
 
     # Sparse drafting head and its per-round flag (set up in the constructor when enabled; class-level
@@ -763,6 +766,7 @@ class Generator:
 
         results = []
         self.iterate_start_jobs(results)
+        pre = self._pre_take()   # hecate (prelaunch): drafts + verify of this step launched by the previous iteration
 
         # Perform one round of prefill. While some active job is already generating, prompt ingestion shares
         # the GPU with it: at most one job with prompt left to ingest runs a pass per iteration, with the
@@ -820,7 +824,9 @@ class Generator:
         if self.sparse_head is not None and draft_window > 0:
             self._sparse_flag = self.sparse_head.round_flag()
             round_start = time.perf_counter()
-        if self.draft_model and draft_window > 0:
+        if pre is not None:
+            draft_tokens = pre["draft_pinned"]
+        elif self.draft_model and draft_window > 0:
             if self.dflash_draft:
                 draft_tokens = self.iterate_draftmodel_dflash_gen(results, draft_window)
             elif self.mtp_draft:
@@ -842,7 +848,9 @@ class Generator:
                 draft_tokens, self.row_limited(self.hybrid_draft_tokens)
             )
 
-        self.iterate_gen(results, draft_tokens)
+        self.iterate_gen(results, draft_tokens, pre = pre)
+        if _PRELAUNCH and getattr(self, "_pre", None) is None:
+            self._prelaunch_next()
         if round_start is not None and draft_tokens is not None:
             # MTP drafts one token per head call; DFlash drafters take one head call for the whole block
             drafted = draft_tokens.shape[-1]
@@ -1664,7 +1672,203 @@ class Generator:
             self.draft_model.prefill(g["ids"], {"attn_mode": "flash_attn", "block_table": g["block_table"],
                 "cache": self.draft_cache, "cache_seqlens": g["cache_seqlens"], "target_hidden": g["target_hidden"]})
 
-    def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None):
+    def _pre_take(self):
+        """hecate (prelaunch): hand the prelaunched step to this iteration if its job is still the only one decoding;
+        otherwise drain it (its K/V writes lie past the job's position and its draft-cache rows are the accepted gap)"""
+        pre = getattr(self, "_pre", None)
+        self._pre = None
+        if pre is None:
+            return None
+        job = pre["job"]
+        ok = len(self.active_jobs) == 1 and self.active_jobs[0] is job and not self.pending_jobs and \
+            job.is_prefill_done() and job.sequences[0].kv_position == pre["kvp"]
+        if not ok:
+            torch.cuda.synchronize()
+            self._pre_stats["drop"] += 1
+            return None
+        pre["event"].synchronize()
+        self._pre_stats["use" if pre.get("logits") is not None else "draft_only"] += 1
+        if sum(self._pre_stats.values()) % 2000 == 0:
+            print(f" -- hecate prelaunch: {self._pre_stats}", flush = True)
+        return pre
+
+    def _prelaunch_fast(self, job, staged, draft_tokens, batch_ids, p_export_states, W):
+        """hecate (prelaunch): the single decoding job's next step from this step's sampled tokens, before the
+        per-token bookkeeping; the staging of _prelaunch_next, written from the post-acceptance state"""
+        if not hasattr(self, "_pre_stats"):
+            self._pre_stats = {"use": 0, "draft_only": 0, "drop": 0, "skip": 0}
+        if self.pending_jobs or not self.mtp_draft or self.dflash_draft or self.ngram_match_min or \
+                self.hybrid_draft_tokens or self.sparse_head is not None or self.draft_calibrator is not None or \
+                self.target_recurrent or self.draft_recurrent or self.recurrent_cache is not None or \
+                self.draft_model is None or p_export_states is None:
+            return
+        if len(job.sequences) != 1 or job.checkpoint is not None or job.forced_ids is not None or \
+                job.new_tokens < job.min_new_tokens or job.sampler.reqs_past_ids or \
+                any(f.is_active or f.trigger_token is not None for f in job.filters):
+            return
+        vals = [int(staged[i][0][0].view(-1)[0]) for i in range(W)]
+        n_acc = 1
+        for i in range(W - 1):
+            if int(draft_tokens[0, i]) != vals[i]:
+                break
+            n_acc += 1
+        window = self.row_limited(self.num_draft_tokens)
+        if window <= 0 or job.new_tokens + n_acc + window + 2 > job.max_new_tokens:
+            self._pre_stats["skip"] += 1
+            return
+        vg = __import__("sys").modules.get("exl3_vgraph")
+        if vg is None or not vg.DRAFT or not vg.ON or self.draft_model.caps.get("draft_uses_target_cache", False):
+            return
+        seq = job.sequences[0]
+        kv_new = seq.kv_position + n_acc
+        base_len = job.get_max_seq_len() + n_acc        # the job's length once this step's tokens are appended
+        if base_len - 1 != kv_new:
+            self._pre_stats["skip"] += 1
+            return
+        target_hidden = p_export_states[-1]
+        gap = None
+        if n_acc > 1 and _MTP_MERGE:
+            gap = {"ids": batch_ids[0:1, 1:n_acc].clone(), "target_hidden": target_hidden[0:1, :n_acc - 1, :]}
+        temp_hidden = target_hidden[0:1, n_acc - 1:n_acc, :]
+        dpages = _pad_pages((base_len + window + 1 + PAGE_SIZE - 1) // PAGE_SIZE)
+        dbi = self._staging("draft_block_index", 1, dpages)
+        dbi.zero_()
+        dsl = self._staging("draft_cache_seqlens", 1)
+        sbi = seq.block_index_tensor[:, :dpages]
+        dbi[0:1, :sbi.shape[-1]].copy_(sbi)
+        dsl[0] = kv_new
+        bids = self.draft_input_ids_pinned[:1, :]
+        bids.fill_(vals[n_acc - 1])
+        d = vg.draft_graph(self, 1, dbi, dsl, bids, temp_hidden, gap, window, defer = True)
+        if d is None:
+            self._pre_stats["skip"] += 1
+            return
+        pre = {"job": job, "kvp": kv_new, "draft_pinned": d["pinned"], "event": d["event"], "logits": None,
+               "fast": True}
+        mpb = _pad_pages((base_len + window + window + PAGE_SIZE - 1) // PAGE_SIZE)
+        use_offsets = "mrope" in self.model.caps
+        arena = self._stage_arena(1, mpb, use_offsets)
+        blk, csl, pos = arena[1]
+        ext.generator_stage_decode(arena[0], mpb, [seq.block_index_tensor], [kv_new],
+                                   [job.alt_rope_offset] if use_offsets else [], None, [], [], [])
+        params = {
+            "attn_mode": "flash_attn",
+            "block_table": blk,
+            "cache": self.cache,
+            "cache_seqlens": csl,
+            "recurrent_states": None,
+            "indexed_embeddings": job.embeddings,
+            "positions": pos,
+            "recurrent_history": True,
+            "pinned_staging": True,
+        }
+        self._upload_arena(arena, 1, mpb, use_offsets, params)
+        params.update(self.draft_model.draft_verifier_params)
+        if params.get("indexed_embeddings"):
+            self._pre = pre
+            return
+        tok = getattr(self, "_pre_tok", None)
+        if tok is None:
+            tok = self._pre_tok = torch.empty((1, 1), dtype = torch.long, pin_memory = True)
+        tok.fill_(vals[n_acc - 1])
+        p2 = {k: v_ for k, v_ in params.items() if k != "indexed_embeddings"}
+        logits = vg.verify_prelaunch(self.model, tok, d["dev"], p2)
+        if logits is not None:
+            pre.update(logits = logits, params = {**p2, "indexed_embeddings": job.embeddings}, arena = arena,
+                       max_pages_batch = mpb)
+        self._pre = pre
+
+    def _prelaunch_next(self):
+        """hecate (prelaunch): the single decoding job's next MTP drafts and, when its graph exists, the verify that consumes
+        them on the device, enqueued now so the GPU does not idle while this iteration's results are processed"""
+        if not hasattr(self, "_pre_stats"):
+            self._pre_stats = {"use": 0, "draft_only": 0, "drop": 0, "skip": 0}
+        if len(self.active_jobs) != 1 or self.pending_jobs or not self.mtp_draft or self.dflash_draft or \
+                self.ngram_match_min or self.hybrid_draft_tokens or self.sparse_head is not None or \
+                self.draft_calibrator is not None or self.target_recurrent or self.draft_recurrent or \
+                self.recurrent_cache is not None or self.draft_model is None:
+            return
+        job = self.active_jobs[0]
+        if not job.is_prefill_done() or len(job.sequences) != 1 or job.mtp_last_hidden is None or \
+                job.checkpoint is not None or job.forced_ids is not None or job.new_tokens < job.min_new_tokens or \
+                any(f.is_active or f.trigger_token is not None for f in job.filters) or job.sampler.reqs_past_ids:
+            self._pre_stats["skip"] += 1
+            return
+        window = self.row_limited(self.num_draft_tokens)
+        if window <= 0 or job.new_tokens + window + 2 > job.max_new_tokens:
+            self._pre_stats["skip"] += 1
+            return
+        vg = __import__("sys").modules.get("exl3_vgraph")
+        if vg is None or not vg.DRAFT or not vg.ON or getattr(self.draft_model.caps, "get", lambda *a: False)("draft_uses_target_cache", False):
+            return
+        seq = job.sequences[0]
+        last = seq.sequence_ids.torch_slice(seq.kv_position, None)
+        if last.shape[-1] != 1:
+            self._pre_stats["skip"] += 1
+            return
+        # drafts: as iterate_draftmodel_mtp_gen up to its draft-graph call
+        max_seq_len = job.get_max_seq_len() + window + 1
+        dpages = _pad_pages((max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE)
+        block_index = self._staging("draft_block_index", 1, dpages)
+        block_index.zero_()
+        cache_seqlens = self._staging("draft_cache_seqlens", 1)
+        sbi = seq.block_index_tensor[:, :dpages]
+        block_index[0:1, :sbi.shape[-1]].copy_(sbi)
+        cache_seqlens[0] = seq.kv_position
+        batch_ids = self.draft_input_ids_pinned[:1, :]
+        batch_ids.copy_(last)
+        temp_hidden = job.mtp_last_hidden
+        gap = None
+        if _MTP_MERGE:
+            gp = getattr(job, "mtp_gap", None)
+            if gp is not None and gp.get("owner") is job.mtp_last_hidden:
+                gap = gp; job.mtp_gap = None
+            else:
+                self._mtp_flush_gaps()
+        d = vg.draft_graph(self, 1, block_index, cache_seqlens, batch_ids, temp_hidden, gap, window, defer = True)
+        if d is None:
+            if gap is not None:
+                job.mtp_gap = gap
+            self._pre_stats["skip"] += 1
+            return
+        pre = {"job": job, "kvp": seq.kv_position, "draft_pinned": d["pinned"], "event": d["event"], "logits": None}
+        # verify: as iterate_gen's staging for one job with a draft window
+        msl = job.get_max_seq_len() + window + window
+        mpb = _pad_pages((msl + PAGE_SIZE - 1) // PAGE_SIZE)
+        use_offsets = "mrope" in self.model.caps
+        arena = self._stage_arena(1, mpb, use_offsets)
+        blk, csl, pos = arena[1]
+        ext.generator_stage_decode(arena[0], mpb, [seq.block_index_tensor], [seq.kv_position],
+                                   [job.alt_rope_offset] if use_offsets else [], None, [], [], [])
+        params = {
+            "attn_mode": "flash_attn",
+            "block_table": blk,
+            "cache": self.cache,
+            "cache_seqlens": csl,
+            "recurrent_states": None,
+            "indexed_embeddings": job.embeddings,
+            "positions": pos,
+            "recurrent_history": True,
+            "pinned_staging": True,
+        }
+        self._upload_arena(arena, 1, mpb, use_offsets, params)
+        params.update(self.draft_model.draft_verifier_params)
+        if params.get("indexed_embeddings"):
+            self._pre = pre
+            return
+        tok = getattr(self, "_pre_tok", None)
+        if tok is None:
+            tok = self._pre_tok = torch.empty((1, 1), dtype = torch.long, pin_memory = True)
+        tok.copy_(last)
+        p2 = {k: v_ for k, v_ in params.items() if k != "indexed_embeddings"}
+        logits = vg.verify_prelaunch(self.model, tok, d["dev"], p2)
+        if logits is not None:
+            pre.update(logits = logits, params = {**p2, "indexed_embeddings": job.embeddings}, arena = arena,
+                       max_pages_batch = mpb)
+            ev = torch.cuda.Event(); ev.record(); pre["event_v"] = ev
+        self._pre = pre
+
+    def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None, pre: dict | None = None):
         if _MTP_MERGE:
             self._mtp_flush_gaps()
 
@@ -1692,7 +1896,14 @@ class Generator:
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
         max_pages_batch = _pad_pages(max_pages_batch)
         use_offsets = "mrope" in self.model.caps
-        arena = self._stage_arena(batch_size, max_pages_batch, use_offsets)
+        pre_v = pre if pre is not None and pre.get("logits") is not None else None
+        if pre_v is not None:
+            # hecate (prelaunch): the verify of this step already ran on these staged tables (its pinned sources may
+            # still be in flight, so they are not restaged)
+            assert pre_v["max_pages_batch"] == max_pages_batch, (pre_v["max_pages_batch"], max_pages_batch)
+            arena = pre_v["arena"]
+        else:
+            arena = self._stage_arena(batch_size, max_pages_batch, use_offsets)
         block_index, cache_seqlens, positions = arena[1]
 
         # Collect the rows' tables, and their input IDs and indexed embeddings. Jobs may contribute multiple
@@ -1739,9 +1950,10 @@ class Generator:
             batch_ids = self._staging("batch_ids", rows, 1, torch.long)
         else:
             batch_ids = None
-        ext.generator_stage_decode(
-            arena[0], max_pages_batch, seq_bi, seq_kvp, seq_rope, batch_ids, dec_ids, dec_pages, dec_offsets
-        )
+        if pre_v is None:
+            ext.generator_stage_decode(
+                arena[0], max_pages_batch, seq_bi, seq_kvp, seq_rope, batch_ids, dec_ids, dec_pages, dec_offsets
+            )
         if not decode_rows:
             input_ids_list = []
             for job in batch_jobs:
@@ -1784,13 +1996,17 @@ class Generator:
             "recurrent_history": draft_tokens is not None,
             "pinned_staging": True,
         }
-        self._upload_arena(arena, batch_size, max_pages_batch, use_offsets, params)
-        if self.draft_model:
-            params.update(self.draft_model.draft_verifier_params)
-        batch_logits = self.model.forward(
-            input_ids = batch_ids,
-            params = params,
-        )
+        if pre_v is not None:
+            params = pre_v["params"]
+            batch_logits = pre_v["logits"]
+        else:
+            self._upload_arena(arena, batch_size, max_pages_batch, use_offsets, params)
+            if self.draft_model:
+                params.update(self.draft_model.draft_verifier_params)
+            batch_logits = self.model.forward(
+                input_ids = batch_ids,
+                params = params,
+            )
 
         # Keep only the fields needed below for draft-cache updates and drop the params dict so it cannot extend
         # references to recurrent state objects past this iteration.
@@ -1953,6 +2169,15 @@ class Generator:
                                 pinned_w[0:1, i:i + 1].copy_(sampled[0].view(1, 1), non_blocking = True)
                                 staged[i] = ((pinned_w[0:1, i:i + 1],) + sampled[1:], False)
                         torch.cuda.synchronize(batch_logits.device)
+                    # hecate (prelaunch): the accepted count is known here; launch the next step's drafts and
+                    # verify before the per-token bookkeeping below. The step's tables it reads later are snapshotted
+                    # first, since the prelaunch restages the shared pinned buffers
+                    if _PRELAUNCH and draft_tokens is not None and len(self.active_jobs) == 1 and \
+                            getattr(self, "_pre", None) is None:
+                        draft_tokens = draft_tokens.clone()
+                        block_index = block_index.clone()
+                        p_cache_seqlens = p_cache_seqlens.clone() if p_cache_seqlens is not None else None
+                        self._prelaunch_fast(job, staged, draft_tokens, batch_ids, p_export_states, W)
 
                 for i in range(W):
                     positions_used = i + 1
@@ -2179,6 +2404,9 @@ class Generator:
                 ].clone()
                 if getattr(job, "mtp_gap", None) is not None:
                     job.mtp_gap["owner"] = job.mtp_last_hidden   # stale once a rewind / replay replaces the carry
+                pf_ = getattr(self, "_pre", None)
+                if pf_ is not None and pf_.get("fast") and pf_["job"] is job:
+                    job.mtp_gap = None   # hecate (prelaunch): the fast lane's draft pass already consumed the gap rows
 
         # Release pages for completed jobs. Finished and requeued jobs no longer need their active page references.
         # Requeued recurrent jobs may stash the last checkpoint first so the next queued job can resume from cached

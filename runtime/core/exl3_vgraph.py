@@ -15,7 +15,10 @@ What may change from step to step and how the captured graph sees it:
     differ); the GB300's CPU_DONE wait is >= g and resets the flag to 0 (tier_split._cpu_partial), so a stale larger
     generation can never satisfy it
   - outputs: the logits tensor and the MTP export states are the captured static tensors (states cloned per step)
-The first step of a new key runs eagerly (warms workspaces and caches for that shape), the second captures and replays."""
+The first step of a new key runs eagerly (warms workspaces and caches for that shape), the second captures and replays.
+Pipelined MTP step (EXL3_PRELAUNCH, tools/dev/prelaunch_patch.py): verify_prelaunch replays an existing verify graph on
+drafted ids that are still on the device, and draft_graph(defer=True) replays an existing draft graph with an async
+readback, so the generator can launch a step before it finishes the previous step's bookkeeping."""
 import collections
 import ctypes
 import os
@@ -64,7 +67,7 @@ def _draft_body(gen, B, n_gap, window, sl_host):
     return torch.cat(cols, dim=1)
 
 
-def draft_graph(gen, bsz, block_index, cache_seqlens, batch_ids, temp_hidden, gap, window):
+def draft_graph(gen, bsz, block_index, cache_seqlens, batch_ids, temp_hidden, gap, window, defer=False):
     if _D["dead"] or _S["dead"] or _S["fe"] is None or bsz != 1:
         return None
     ts = sys.modules.get("tier_split")
@@ -78,6 +81,8 @@ def draft_graph(gen, bsz, block_index, cache_seqlens, batch_ids, temp_hidden, ga
         return None
     W = int(block_index.shape[1])
     key = (window, n_gap, W)
+    if defer and key not in _D["graphs"]:
+        return None
     if key not in _D["warm"]:
         _D["warm"].add(key)
         _D["n"]["draft_eager"] += 1
@@ -135,6 +140,10 @@ def draft_graph(gen, bsz, block_index, cache_seqlens, batch_ids, temp_hidden, ga
         print(f" -- vgraph: captured draft graph {key}", flush=True)
     ent["g"].replay()
     _D["n"]["draft_replay"] += 1
+    if defer:   # hecate (prelaunch): async readback, the caller launches the verify on the device ids first
+        gen.draft_ids_pinned[:bsz, :window].copy_(ent["out"], non_blocking=True)
+        ev = torch.cuda.Event(); ev.record()
+        return {"dev": ent["out"], "pinned": gen.draft_ids_pinned[:, :window], "event": ev}
     gen.draft_ids_pinned[:bsz, :window].copy_(ent["out"])
     return gen.draft_ids_pinned[:, :window]
 _PARAM_KEYS = {"attn_mode", "block_table", "cache", "cache_seqlens", "recurrent_states", "indexed_embeddings", "positions",
@@ -172,6 +181,41 @@ def _watchdog():
         except Exception as ex:
             print(f" -- vgraph WATCHDOG: flag read failed: {ex}", flush=True)
         print(" -- vgraph WATCHDOG: last actions: " + " | ".join(_S["ring"]), flush=True)
+
+
+def verify_prelaunch(model, last_tok, draft_dev, params):
+    """hecate (prelaunch): replay an already captured verify graph whose input ids are the pinned last token plus the drafted
+    ids still on the device; None when no graph matches (the caller then runs the regular forward)"""
+    ts = sys.modules.get("tier_split")
+    if _S["dead"] or ts is None or not ON:
+        return None
+    sl_h, bt_h = params.get("cache_seqlens"), params.get("block_table")
+    if sl_h is None or bt_h is None or sl_h.is_cuda or bt_h.is_cuda or set(params) - _PARAM_KEYS - {"export_states"}:
+        return None
+    R = 1 + int(draft_dev.shape[-1])
+    sl = sl_h.tolist()
+    lim = _S.get("maxctx")
+    if lim is None or sl[0] + R > lim:
+        return None
+    dev = torch.device("cuda", torch.cuda.current_device())
+    ptrs = _dev_ptrs(params, dev)
+    key = (R, bt_h.shape[1], ())
+    ent = _S["graphs"].get(key)
+    ids = _S["ids"].get(R)
+    if ptrs is None or ent is None or ent["ptrs"] != ptrs or ids is None:
+        return None
+    ids[:, :1].copy_(last_tok, non_blocking=True)
+    ids[:, 1:].copy_(draft_dev.view(1, -1))
+    if ts.rg.MODS:
+        ts.rg.launch(R)
+    ent["g"].replay()
+    ev = torch.cuda.Event(); ev.record(); _S["last_ev"] = (ev, time.time())
+    _S["ring"].append(f"prelaunch {key[0]}x{key[1]} sl {sl[0]}")
+    for k, v_ in ent["new"].items():
+        params[k] = [t.clone() for t in v_] if k == "export_states" else v_
+    _S["n"]["replay"] += 1
+    _S["n"]["pre"] = _S["n"].get("pre", 0) + 1
+    return ent["out"]
 
 
 def _eager(reason):
@@ -316,9 +360,9 @@ def install():
     G = _g.Generator
     ig = G.iterate_gen
 
-    def iterate_gen(self, results, draft_tokens=None):
+    def iterate_gen(self, results, draft_tokens=None, pre=None):
         if draft_tokens is None:
-            return ig(self, results, draft_tokens)
+            return ig(self, results, draft_tokens, pre=pre)
         m = self.model
         prev = m.__dict__.get("forward")
         fw = m.forward                      # bound (class or an inner wrapper's) forward
@@ -329,7 +373,7 @@ def install():
             return _verify(m, lambda _m, i, p: _fw(input_ids=i, params=p), input_ids, params)
         m.forward = forward
         try:
-            return ig(self, results, draft_tokens)
+            return ig(self, results, draft_tokens, pre=pre)
         finally:
             if prev is None:
                 m.__dict__.pop("forward", None)

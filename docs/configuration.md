@@ -25,11 +25,12 @@ Larger pools come from moving experts out of HBM:
 
 | Profile | `HECATE_PLACEMENT` | `HECATE_RTX_I4` | KV pool fits | Decode, c=1 (stock) |
 |---|---|---|---|---|
-| default | `tier-144-85-far27-mtp256` | 0 | 512K | ~140 tok/s |
-| +5.4 GB | `tier-140-85-far31-mtp256` | 4 | ~620K (622,592 tested) | ~131 tok/s (-5%) |
+| default | `tier-144-85-far27-mtp256` | 0 | 512K | ~148 tok/s |
+| +5.4 GB | `tier-140-85-far31-mtp256` | 4 | ~620K (622,592 tested) | ~131 tok/s (-5% vs the default then) |
 | 1M | `tier-120-85-far51-mtp256` | 4 | 1M (16 GB HBM left) | ~100 tok/s (-27%); 375K-token prompt: 1,507 tok/s prefill, 67 tok/s decode |
 
-Placements come from `tools/placement/kv_placement.py`. It moves the coldest hot experts to the head of the cold tier.
+The two larger profiles were measured on release 2, before the pipelined decode step (the default ran ~140 tok/s
+then). Placements come from `tools/placement/kv_placement.py`. It moves the coldest hot experts to the head of the cold tier.
 With `HECATE_RTX_I4=k`, the first k of those run as int4 on the RTX instead of on the Grace cores (same weights); the RTX
 band then uses ExLlamaV3's cooperative MoE kernels instead of `moe3`. Every placement here is lossless: they change where
 experts run, not their weights.
@@ -39,6 +40,7 @@ experts run, not their weights.
 | Variable | Default | |
 |---|---|---|
 | `EXL3_VERIFY_GRAPH` / `EXL3_DRAFT_GRAPH` | 1 / 1 | decode-verify forward and MTP draft passes as CUDA graphs (contexts ≤ 2048 tokens) |
+| `EXL3_PRELAUNCH` | 1 | pipelined decode step for a single conversation: the next MTP drafts + verify are launched as soon as a step's accepted tokens are known, before its bookkeeping (needs the two graphs above) |
 | `EXL3_ROUTER_FUSED` | 1 | router GEMV + sigmoid/bias top-8 as one kernel |
 | `EXL3_DRAFT_HEAD_I4` | 1 | int4 copy of the LM head for MTP drafts (+0.48 GB) |
 | `EXL3_TIER_SH_FAST` | 1 | shared expert straight into the hot-tier accumulator |
