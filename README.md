@@ -120,13 +120,14 @@ cp .env.example .env
 **3. Build and start**
 
 ```bash
-docker compose build                 # ~30 min: ExLlamaV3 + the patched extension for sm_103a / sm_120a
+docker compose build                 # ~10 min on the Grace CPU: ExLlamaV3 + the patched extension (sm_103a / sm_120a)
 docker compose up -d
 docker compose logs -f hecate        # ready at the line starting with "warmup:"
 ```
 
-Loading takes ~6-8 min from a cold page cache. The first start also compiles the runtime kernels (moe4, moe3, Grace
-band, Triton) into `./cache`, which adds a few minutes once.
+A start takes ~4-5 min with the weights in the page cache, longer when they come from disk. The first start also
+compiles the runtime kernels (moe4, moe3, Grace band, Triton) into `./cache`, ~9 min in all, once. The warmup ends with
+a ~10K-token prompt, so the first long request already runs at full speed.
 
 **4. Use it.** The server speaks the OpenAI API on port 8103 (`/v1/chat/completions`, `/v1/completions`,
 `/v1/models`); the model is called `base`:
