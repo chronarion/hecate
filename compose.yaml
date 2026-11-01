@@ -1,0 +1,39 @@
+# Hecate: GLM-5.3 on a DGX Station GB300 (GB300 + RTX PRO 6000 Blackwell + Grace).
+#   cp .env.example .env   # set the two GPU UUIDs and the weights directory
+#   docker compose up -d   # OpenAI-compatible API on :8103 once "warmup:" appears in the log (~5-8 min cold)
+# GPUs are requested by CDI name (nvidia-ctk cdi generate); Docker has no NVIDIA runtime hook on DGX OS 7.
+services:
+  hecate:
+    image: ${HECATE_IMAGE:-hecate:latest}
+    build: { context: ., dockerfile: docker/Dockerfile }
+    container_name: hecate
+    restart: unless-stopped
+    ipc: host
+    shm_size: 32g
+    ulimits: { memlock: -1 }
+    ports: ["${HECATE_PORT:-8103}:8103"]
+    devices:
+      - nvidia.com/gpu=${HECATE_GB300_UUID:?set HECATE_GB300_UUID}
+      - nvidia.com/gpu=${HECATE_RTX_UUID:?set HECATE_RTX_UUID}
+    environment:
+      CUDA_VISIBLE_DEVICES: ${HECATE_GB300_UUID},${HECATE_RTX_UUID}   # GB300 = cuda:0, RTX = cuda:1
+      HF_HUB_OFFLINE: "1"
+      # context / cache (see runtime/render_config.py): one 1M conversation = HECATE_MAX_SEQ_LEN 1048576 with a profile
+      # that leaves room for the cache (docs/configuration.md, "Memory budget")
+      HECATE_MAX_SEQ_LEN: ${HECATE_MAX_SEQ_LEN:-262144}
+      HECATE_CACHE_TOKENS: ${HECATE_CACHE_TOKENS:-524288}
+      HECATE_CACHE_MODE: ${HECATE_CACHE_MODE:-Q6}
+      HECATE_DRAFTS: ${HECATE_DRAFTS:-3}
+      HECATE_MODEL_DIR: /weights
+      HECATE_MODEL_NAME: base
+      EXL3_TIER_SPLIT: /weights/placement/${HECATE_PLACEMENT:-tier-144-85-far27-mtp256}.json
+      EXL3_RTX_SPLIT: /weights/placement/${HECATE_PLACEMENT:-tier-144-85-far27-mtp256}.json
+      EXL3_TIER_U4: /weights/int4
+      EXL3_I8_SRC: /weights/int8
+      EXL3_TENSOR_OVERRIDE: /weights/rtx-band
+      EXL3_TIER_RTX_I4: ${HECATE_RTX_I4:-0}
+      EXL3_TIER_CPU_THREADS: ${HECATE_CPU_THREADS:-60}
+      EXL3_TIER_CPU_CORE0: ${HECATE_CPU_CORE0:-12}
+    volumes:
+      - ${HECATE_WEIGHTS:?set HECATE_WEIGHTS}:/weights:ro
+      - ./cache:/root/.cache:rw          # compiled kernels (moe4, Grace band, Triton), built on first start

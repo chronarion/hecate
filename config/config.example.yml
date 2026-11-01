@@ -1,0 +1,25 @@
+network:
+  host: 0.0.0.0
+  port: 8103
+  disable_auth: true
+  api_servers: ["OAI"]
+  web_ui: false
+logging:
+  log_prompt: false
+  log_requests: false
+model:
+  model_dir: /weights
+  model_name: base
+  backend: exllamav3
+  max_seq_len: 262144
+  cache_mode: Q6
+  cache_size: 524288
+  tensor_parallel: false
+  gpu_split_auto: false
+  gpu_split: [250, 0]
+  autosplit_reserve: [4096]
+  chunk_size: 8192
+  reasoning: true
+draft_model:
+  draft_mode: mtp
+  draft_num_tokens: 3
