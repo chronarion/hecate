@@ -47,6 +47,11 @@ experts run, not their weights.
 | `EXL3_EMBED_GPU` | 1 | token embedding in HBM (+1.9 GB; avoids a host sync per draft pass) |
 | `EXL3_RTX_STAGE` | 1 | copy each layer's mailbox into RTX VRAM before the RTX kernels |
 | `EXL3_RTX_MOE3` | 1 | run the RTX band on the moe3 trellis MoE kernels; 0 = ExLlamaV3's cooperative MoE kernels |
+| `EXL3_RTX_PREFILL_MOE3P` | 1 | prefill of the RTX band (chunks over 64 rows) on the moe3p kernels: grouped GEMMs that decode the 3-bit trellis inside the MMA loop; 0 = each picked expert reconstructed to FP16 per chunk + grouped GEMMs |
+| `EXL3_TIER_PREFILL_MOE4P` | 1 | prefill of the int4 tiers (chunks over 64 rows) on the moe4p kernels: grouped GEMMs on the stored int4 fragments, the Grace tier read in place over C2C; 0 = bf16 dequant per chunk + grouped GEMMs |
+| `EXL3_I8_UNPACK_FUSED` | 1 | prefill unpacks the int8 linears (attention, shared experts, LM head) with one fused kernel; 0 = torch ops (same values) |
+| `EXL3_I8_GEMV_ROWS` | 64 | int8 linears run the decode GEMV in 8-row chunks up to this many rows (decode batches at concurrency 16-32); more rows unpack the weights |
+| `EXL3_RTX_P3_NPOS` / `EXL3_TIER_P4_NPOS` | 16384 / 16384 | expert picks per moe3p / moe4p call (scratch ~45 KB per pick on the RTX / GB300) |
 | `EXL3_HMLA_PREFILL` | 1 | sparse (DSA) attention of prompt chunks on the tcgen05 kernel (`docker/patches/exllamav3/hmla`); 0 = the Triton gather kernel |
 | `EXL3_HMLA_DECODE` / `EXL3_HMLA_NS` | 1 / 16 | sparse (DSA) attention of decode steps (contexts above 2,048 tokens) on the tcgen05 kernel, each query row's key list split across NS CTAs; 0 = the Triton split + combine. Shorter contexts keep the Triton kernels |
 | `EXL3_MLA_BLOCK_H_Q`, `EXL3_MLA_SPLIT_TILES`, `EXL3_MLA_COMBINE_DSPLIT`, `EXL3_COMBINE_CFG` | 4, 1, 16, 8,1 | MLA decode launch shapes |

@@ -12,6 +12,7 @@ after the local expert kernels):
   GB300 stream at combine: wait DONE >= gen, H2D of the partials, add into the routed sum
 One slot set serves every layer: stream order (the GB300 waits for DONE before the next layer's D2H) serializes them."""
 import json, os, re, types
+import numpy as np
 import torch
 import torch.nn.functional as F
 from cuda.bindings import driver as cu
@@ -22,6 +23,16 @@ PLACE = json.load(open(os.environ["EXL3_RTX_SPLIT"]))
 RDEV = int(os.environ.get("EXL3_RTX_DEVICE", "1"))
 CAP = int(os.environ.get("EXL3_RTX_CAP_ROWS", "2048"))
 CHUNK = 32                                   # coop kernel rows per launch (scratch sized for 32 rows x top-8)
+# EXL3_RTX_PREFILL_MOE3P=1 (default): prefill on the moe3p kernels (tier/moe3/moe3p.cu, trellis decoded in the GEMM),
+# at most EXL3_RTX_P3_NPOS band picks per call (scratch ~45 KB per pick); 0 = per-expert FP16 reconstruct + grouped GEMMs
+PF3 = os.environ.get("EXL3_RTX_PREFILL_MOE3P", "1") == "1"
+NPOS = max(int(os.environ.get("EXL3_RTX_P3_NPOS", "16384")), CAP)
+M3P = None
+if PF3:
+    from torch.utils.cpp_extension import load as _load
+    _bd = os.path.join(os.environ.get("EXL3_TIER_BUILD", "/tmp"), "build_moe3p"); os.makedirs(_bd, exist_ok=True)
+    M3P = _load(name="moe3p", sources=[os.path.join(os.path.dirname(os.path.abspath(__file__)), "moe3", "moe3p.cu")],
+                build_directory=_bd, verbose=False, extra_cuda_cflags=["-O3", "-gencode=arch=compute_120a,code=sm_120a", "--use_fast_math"])
 ZEROCOPY = os.environ.get("EXL3_RTX_ZEROCOPY", "1") == "1"   # kernels read/write the pinned slots in place (no copy-engine hops)
 GEQ = cu.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_GEQ
 WDEF = cu.CUstreamWriteValue_flags.CU_STREAM_WRITE_VALUE_DEFAULT
@@ -178,25 +189,63 @@ def _rtx_prefill(self, X, SEL, RW, OUT, bsz, counts):
         p0 += Pg
 
 
+def _rtx_prefill3(self, X, SEL, RW, OUT, bsz, counts):
+    """Prefill on the RTX (> PF_ROWS rows), on S.stream, with the moe3p kernels: the band picks sorted by expert (the same
+    stable argsort as _rtx_prefill), row blocks of <= 64 picks per expert, the trellis decoded inside the GEMMs (each row
+    block streams its expert's weights once; nothing is materialized in FP16). At most NPOS picks per call."""
+    S, R = _S, self._rtx; first = R.first; K8 = SEL.shape[-1]
+    fs = SEL[:bsz].reshape(-1)
+    order = torch.argsort(fs, stable=True)
+    n_rtx = sum(counts); start = fs.numel() - n_rtx
+    seg = order[start:]
+    tok = (seg // K8).int(); eid = (fs[seg] - first).int(); wt = RW[:bsz].reshape(-1)[seg].float()
+    out = OUT[:bsz]; out.zero_()
+    scr = getattr(S, "_p3scr", None)
+    if scr is None or scr[0].device != X.device:
+        scr = S._p3scr = M3P.scratch(X.device, NPOS)
+    for p0, p1, rbt in pick_groups(counts, NPOS):
+        M3P.forward(X[:bsz], tok[p0:p1], eid[p0:p1], wt[p0:p1], torch.from_numpy(rbt).pin_memory().to(X.device, non_blocking=True),
+                    *R.tabs, *scr, out)
+
+
+def pick_groups(counts, npos, bm=64):
+    """Work lists of the moe3p / moe4p prefill kernels. counts: picks per expert (picks sorted by expert, no expert above
+    npos). Yields expert groups of <= npos picks as (first pick, end pick, row blocks), row blocks = int32 [n, 4]
+    {expert, first pick relative to the group, picks (<= bm), 0}."""
+    c = np.asarray(counts, dtype=np.int64); ends = np.cumsum(c); e0 = 0
+    while e0 < len(c):
+        p0 = int(ends[e0] - c[e0])
+        e1 = int(np.searchsorted(ends, p0 + npos, side="right"))
+        cg = c[e0:e1]; nrb = (cg + bm - 1) // bm
+        k = np.arange(int(nrb.sum())) - np.repeat(np.cumsum(nrb) - nrb, nrb)         # row block index within its expert
+        rows = np.minimum(bm, np.repeat(cg, nrb) - bm * k)
+        rel = np.repeat(ends[e0:e1] - cg - p0, nrb) + bm * k
+        yield p0, int(ends[e1 - 1]), np.stack([np.repeat(np.arange(e0, e1), nrb), rel, rows, 0 * rows], 1).astype(np.int32)
+        e0 = e1
+
+
 def rtx_submit(self, y, bsz, selected_experts, routing_weights):
     S, R = _S, self._rtx
     assert bsz <= CAP, f"rtx_split: {bsz} rows > CAP {CAP}"
+    prefill = _rtx_prefill3 if M3P is not None and all(round(k) == 3 for k in R.K) else _rtx_prefill
     pf_counts = None
-    if bsz > PF_ROWS:     # rows per RTX expert, from the GB300 copy of the selection (one host sync per layer)
-        pf_counts = torch.bincount(selected_experts.reshape(-1), minlength=R.E)[R.first:].tolist()
+    if bsz > PF_ROWS:     # picks per expert, from the GB300 copy of the selection (one host sync per layer; the GB300's
+        # int4 prefill reuses the counts of its own experts)
+        allc = torch.bincount(selected_experts.reshape(-1), minlength=R.E).tolist()
+        pf_counts = allc[R.first:]; self._pf_counts = allc
     S.gen += 1; G = S.gen
     y = y.contiguous(); sel = selected_experts.contiguous(); rw = routing_weights.contiguous()
     assert y.dtype == torch.half and sel.dtype == torch.long and rw.dtype == torch.half, (y.dtype, sel.dtype, rw.dtype)
     gs = cu.CUstream(torch.cuda.current_stream(y.device).cuda_stream)
     zc = ZEROCOPY and bsz > 1
-    if zc and HANDOFF is not None:
+    if zc and HANDOFF is not None and pf_counts is None:
         vg = S.v[S.g.index]
         HANDOFF(y.view(bsz, -1), sel.view(bsz, -1), rw.view(bsz, -1), vg.y.data_ptr(), vg.s.data_ptr(), vg.w.data_ptr(),
                 int(S.fdev[S.g.index]) + 0, G, bsz, (int(S.fdev[S.g.index]) + 16) if META else 0, META_LAYER(self) if META else 0, 0, 0, 0)
     else:
-        if zc:      # GB300 kernels write straight into the pinned slots over C2C
+        if zc and pf_counts is None:      # GB300 kernels write straight into the pinned slots over C2C
             vg = S.v[S.g.index]; vg.y[:bsz].copy_(y); vg.s[:bsz].copy_(sel); vg.w[:bsz].copy_(rw)
-        else:
+        else:   # prefill: copy-engine D2H (the handoff kernel moves a long prompt chunk at ~40 GB/s)
             _ck(cu.cuMemcpyDtoHAsync(S.hy, y.data_ptr(), bsz * S.H * 2, gs))
             _ck(cu.cuMemcpyDtoHAsync(S.hs, sel.data_ptr(), bsz * S.topk * 8, gs))
             _ck(cu.cuMemcpyDtoHAsync(S.hw, rw.data_ptr(), bsz * S.topk * 2, gs))
@@ -218,10 +267,10 @@ def rtx_submit(self, y, bsz, selected_experts, routing_weights):
         if pf_counts is not None:
             if zc:     # stage the mapped slots on the device once; accumulate on the device; copy the sum back
                 S.x[:bsz].copy_(X[:bsz]); S.sel[:bsz].copy_(SEL[:bsz]); S.rw[:bsz].copy_(RW[:bsz])
-                _rtx_prefill(self, S.x, S.sel, S.rw, S.out, bsz, pf_counts)
+                prefill(self, S.x, S.sel, S.rw, S.out, bsz, pf_counts)
                 OUT[:bsz].copy_(S.out[:bsz])
             else:
-                _rtx_prefill(self, X, SEL, RW, OUT, bsz, pf_counts)
+                prefill(self, X, SEL, RW, OUT, bsz, pf_counts)
             if _PF_CHECK[0] > 0:     # EXL3_RTX_PREFILL_CHECK: compare with the coop kernel on the first calls
                 _PF_CHECK[0] -= 1
                 ref = torch.empty_like(OUT[:bsz])

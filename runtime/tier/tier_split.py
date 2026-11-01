@@ -2,9 +2,9 @@
 
 Every main MoE layer's 256 routed experts are permuted (router rows included) into three tiers:
     [0, hot)          int4 (GPTQ from BF16) in GB300 HBM, run by the moe4 kernels (decode <= 8 rows; prefill: moe4 in
-                      8-row chunks up to 64 rows, else batched dequant + grouped GEMMs)
+                      8-row chunks up to 64 rows, else the moe4p grouped GEMMs)
     [hot, hot + far)  int4 in pinned Grace memory: decode on the Grace cores (cpuband.cpp, 60 threads); prefill on the GB300
-                      (copied to HBM per expert group). With EXL3_TIER_RTX_I4=k the first k of them also live in RTX VRAM
+                      (moe4p reads them in place over C2C). With EXL3_TIER_RTX_I4=k the first k of them also live in RTX VRAM
                       and run there as int4 in decode (rtx_graph.py), freeing HBM when the hot band is made smaller
     [first, 256)      3-bit EXL3 trellis on the RTX PRO 6000 (rtx_split.py loads it; rtx_graph.py runs it in decode as one
                       CUDA graph per step that waits on per-layer ISSUE flags in pinned host memory)
@@ -37,11 +37,18 @@ CPU_CORE0 = int(os.environ.get("EXL3_TIER_CPU_CORE0", "12"))   # workers on core
 SH_FAST = os.environ.get("EXL3_TIER_SH_FAST", "1") == "1"       # shared expert straight into the hot-band accumulator
 PREFILL_MOE4 = os.environ.get("EXL3_TIER_PREFILL_MOE4", "1") == "1"
 _PF_GROUP = int(os.environ.get("EXL3_PREFILL_GROUP", "24"))     # experts per batched-dequant group in long prefill
+# EXL3_TIER_PREFILL_MOE4P=1 (default): prefill above 64 rows on the moe4p grouped GEMMs (moe4/moe4p.cu, int4 decoded in the
+# GEMM, the Grace tier read in place), at most EXL3_TIER_P4_NPOS picks per call (scratch ~44 KB per pick); 0 = batched
+# bf16 dequant + grouped GEMMs
+PF4 = os.environ.get("EXL3_TIER_PREFILL_MOE4P", "1") == "1"
+NPOS4 = int(os.environ.get("EXL3_TIER_P4_NPOS", "16384"))
 _VG = {"cap": False}   # set by exl3_vgraph while it captures a whole-forward graph (the RTX graph is launched outside)
 H_, I_ = 6144, 2048
 
 moe4 = _load_ext(name="moe4", sources=[f"{MOE4_SRC}/moe4.cu"], build_directory=_bd(f"{BUILD}/build"), verbose=False,
                  extra_cuda_cflags=["-O3", "-gencode=arch=compute_103a,code=sm_103a", "--use_fast_math"])
+moe4p = _load_ext(name="moe4p", sources=[f"{MOE4_SRC}/moe4p.cu"], build_directory=_bd(f"{BUILD}/build_moe4p"), verbose=False,
+                  extra_cuda_cflags=["-O3", "-gencode=arch=compute_103a,code=sm_103a", "--use_fast_math"]) if PF4 else None
 _cb = _load_ext(name="cpuband", sources=[os.path.join(os.path.dirname(os.path.abspath(__file__)), "cpuband.cpp")],
                 build_directory=_bd(f"{BUILD}/build_cpuband"), verbose=False, extra_cflags=["-O3", "-mcpu=neoverse-v2"])
 os.sched_setaffinity(0, set(range(CPU_CORE0)))     # the main thread and its later children stay off the Grace workers
@@ -280,8 +287,8 @@ def _dq_stack(ks, j, N, K, dev):
 
 def _hot_prefill(self, y, sel, rw):
     """> 8 rows, both int4 tiers on the GB300. Up to 64 rows: the moe4 decode kernels in 8-row chunks (weights stream
-    once per chunk, the Grace tier read in place). Longer: per group of experts one batched dequant per matrix into a
-    stacked bf16 buffer and three grouped GEMMs (the Grace tier copied to HBM per group)."""
+    once per chunk, the Grace tier read in place). Longer: the moe4p grouped GEMMs (_hot_prefill4), or with
+    EXL3_TIER_PREFILL_MOE4P=0 the bf16 dequant path (_hot_prefill_dq)."""
     Hh = self._hot; T = _T; R = y.shape[0]
     if R <= 64 and PREFILL_MOE4:
         out = torch.empty(R, H_, dtype=torch.float, device=y.device)
@@ -293,6 +300,24 @@ def _hot_prefill(self, y, sel, rw):
                          Hh.tab["gate_s"], Hh.tab["up_s"], Hh.tab["down_s"], *T.scr, yh, T.blocks, T.blocks_a, 0)
         return out
     out = torch.zeros(y.shape[0], H_, dtype=torch.float, device=y.device)
+    if moe4p is not None:
+        _hot_prefill4(self, y, sel, rw, out)
+        if _P4_CHECK[0] > 0:     # EXL3_TIER_PREFILL_CHECK: compare with the bf16 dequant path on the first calls
+            _P4_CHECK[0] -= 1
+            ref = _hot_prefill_dq(self, y, sel, rw, torch.zeros_like(out))
+            print(f" -- int4 prefill check {self.key}: {R} rows, rel diff vs bf16 dequant "
+                  f"{((out - ref).norm() / ref.norm().clamp_min(1e-12)).item():.2e}", flush=True)
+        return out
+    return _hot_prefill_dq(self, y, sel, rw, out)
+
+
+_P4_CHECK = [int(os.environ.get("EXL3_TIER_PREFILL_CHECK", "0"))]
+
+
+def _hot_prefill_dq(self, y, sel, rw, out):
+    """per group of experts one batched dequant per matrix into a stacked bf16 buffer and three grouped GEMMs (the Grace
+    tier copied to HBM per group)"""
+    Hh = self._hot
     # (token, slot) pairs routed to the int4 tiers, sorted by expert once: one host sync for the per-expert counts
     K8 = sel.shape[-1]; fs = sel.reshape(-1)
     idx = (fs < Hh.n).nonzero(as_tuple=True)[0]
@@ -316,6 +341,29 @@ def _hot_prefill(self, y, sel, rw):
         d = torch._grouped_mm(a, Wd, offs=offs); del Wd, a
         out.index_add_(0, rows_all[p0:p0 + Pg], d.float() * w_all[p0:p0 + Pg, None])
         p0 += Pg
+    return out
+
+
+def _hot_prefill4(self, y, sel, rw, out):
+    """> 64 rows on the moe4p kernels: the int4 tiers' picks sorted by expert (one host sync for the counts), row blocks
+    of <= 64 picks per expert, the int4 decoded inside the GEMMs (hot experts from HBM, cold ones read in place from Grace
+    memory); nothing is dequantized to bf16"""
+    Hh = self._hot; K8 = sel.shape[-1]; fs = sel.reshape(-1)
+    order = torch.argsort(fs, stable=True)                   # the int4 tiers' ids [0, n) sort first
+    allc = getattr(self, "_pf_counts", None); self._pf_counts = None     # set by this call's rtx_submit (same selection)
+    counts = allc[:Hh.n] if allc is not None else torch.bincount(fs, minlength=Hh.n)[:Hh.n].tolist()
+    n4 = sum(counts)
+    if n4 == 0:
+        return out
+    seg = order[:n4]
+    tok = (seg // K8).int(); eid = fs[seg].int(); wt = rw.reshape(-1)[seg].float()
+    scr = getattr(_T, "p4scr", None)
+    if scr is None:
+        scr = _T.p4scr = moe4p.scratch(y.device, max(NPOS4, rs.CAP))
+    t = Hh.tab
+    for p0, p1, rbt in rs.pick_groups(counts, scr[0].shape[1]):
+        moe4p.forward(y, tok[p0:p1], eid[p0:p1], wt[p0:p1], torch.from_numpy(rbt).pin_memory().to(y.device, non_blocking=True),
+                      t["gate_w"], t["up_w"], t["down_w"], t["gate_s"], t["up_s"], t["down_s"], *scr, out)
     return out
 
 

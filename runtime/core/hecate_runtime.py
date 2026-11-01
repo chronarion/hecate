@@ -47,8 +47,51 @@ def _pack(codes):
     return q, spw
 
 
+_UNPACK_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_fp16.h>
+// dense_i8 fragment order ([group][k-block of 32][strip][g][q][t][h][c][rh] bytes) -> fp16 [N][K] = (code - 128) * s[n]:
+// one thread per 8 consecutive k of one row (one 16-byte store), the same fp32 math as the torch version
+__global__ void unpack_i8_k(const uint8_t* __restrict__ q, const float* __restrict__ s, half* __restrict__ w, int N, int K, int spw)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x, kc = K / 8;
+    if (i >= N * kc) return;
+    const int n = i / kc, k0 = (i % kc) * 8;
+    const int grp = n / (16 * spw), si = (n % (16 * spw)) / 16, rh = (n % 16) / 8, g = n % 8;
+    const int kb = k0 / 32, t = (k0 % 32) / 16, h = (k0 % 16) / 8;
+    const size_t a = ((size_t) (grp * (K / 32) + kb) * spw + si) * 8 + g;
+    const uint8_t* src = q + a * 64 + t * 8 + h * 4 + rh;          // + qq * 16 + c * 2
+    const float sc = s[n];
+    __align__(16) half o[8];
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) o[j] = __float2half_rn(((float) src[(j >> 1) * 16 + (j & 1) * 2] - 128.f) * sc);
+    *(uint4*) (w + (size_t) n * K + k0) = *(const uint4*) o;
+}
+void unpack_i8(at::Tensor q, at::Tensor s, at::Tensor w, int64_t N, int64_t K, int64_t spw)
+{
+    const int n = (int) (N * K / 8);
+    unpack_i8_k<<<(n + 255) / 256, 256, 0, at::cuda::getCurrentCUDAStream().stream()>>>(q.data_ptr<uint8_t>(), s.data_ptr<float>(),
+        (half*) w.data_ptr(), (int) N, (int) K, (int) spw);
+}
+"""
+_unpack_ext = None
+
+
 def unpack_i8(q, s, N, K, spw):
-    """inverse of the dense_i8 fragment order -> fp16 [N, K] (the int8 weights as a plain matrix)"""
+    """inverse of the dense_i8 fragment order -> fp16 [N, K] (the int8 weights as a plain matrix); one fused kernel on
+    CUDA (prefill runs this per chunk for every int8 linear), the torch ops otherwise"""
+    global _unpack_ext
+    if q.is_cuda and os.environ.get("EXL3_I8_UNPACK_FUSED", "1") == "1":
+        if _unpack_ext is None:
+            from torch.utils.cpp_extension import load_inline
+            bd = os.path.join(os.environ.get("EXL3_TIER_BUILD", "/tmp"), "build_unpack_i8"); os.makedirs(bd, exist_ok=True)
+            _unpack_ext = load_inline(name="unpack_i8", cpp_sources="void unpack_i8(at::Tensor q, at::Tensor s, at::Tensor w, int64_t N, int64_t K, int64_t spw);",
+                                      cuda_sources=_UNPACK_SRC, functions=["unpack_i8"], build_directory=bd,
+                                      extra_cuda_cflags=["-O3", "-gencode=arch=compute_103a,code=sm_103a"])
+        w = torch.empty((N, K), dtype=torch.half, device=q.device)
+        _unpack_ext.unpack_i8(q, s.float().contiguous(), w, N, K, spw)
+        return w
     qq = q.view(N // (16 * spw), K // 32, spw, 8, 4, 2, 2, 2, 2).permute(0, 2, 8, 3, 1, 5, 6, 4, 7).reshape(N, K)
     return ((qq.float() - 128.0) * s[:, None]).half()
 
@@ -141,10 +184,15 @@ def _patch_linear():
     Linear.to_i8_copy = to_i8_copy
 
 
+I8_GEMV_ROWS = int(os.environ.get("EXL3_I8_GEMV_ROWS", "64"))   # up to this many rows: the int8 GEMV in 8-row chunks
+
+
 def _hook_linear(lin):
-    """A linear whose int8 copy comes from stock BF16. Inner level: > 8 rows run the stock int8 weights dequantized on the
-    fly (prefill shares the decode base instead of the trellis); <= 8 rows keep the int8 GEMV. Linear.forward itself
-    (input padding, padded-output trim, scales) stays in charge."""
+    """A linear whose int8 copy comes from stock BF16. Inner level: up to 8 rows the int8 GEMV; up to EXL3_I8_GEMV_ROWS
+    rows the GEMV in 8-row chunks (a decode batch at concurrency 16-32 would otherwise dequantize the whole matrix, the LM
+    head included, every step); more rows (prefill) run the stock int8 weights dequantized on the fly, so prefill shares
+    the decode base instead of the trellis. Linear.forward itself (input padding, padded-output trim, scales) stays in
+    charge."""
     if getattr(lin, "_i8_hooked", False):
         return
     inner = lin.inner
@@ -154,6 +202,10 @@ def _hook_linear(lin):
         if rows <= 8:
             return _f(x, params, out_dtype)
         N = w8[1].numel()
+        if rows <= I8_GEMV_ROWS:
+            x2 = x.reshape(rows, K)
+            y = torch.cat([_f(x2[r:r + 8].unsqueeze(0), params, out_dtype).reshape(-1, N) for r in range(0, rows, 8)])
+            return y.view(*x.shape[:-1], N)
         W = unpack_i8(w8[0], w8[1], N, K, w8[4])
         y = (x.reshape(-1, K).half() @ W.T).to(out_dtype or getattr(_i, "default_out_dtype", None) or torch.half)
         return y.view(*x.shape[:-1], N)

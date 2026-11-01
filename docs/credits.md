@@ -23,6 +23,9 @@ it builds on or borrows ideas from.
   published KLD numbers are in our comparison table.
 - **LOP3 / magic-number int4 to fp16 decode**, from FasterTransformer and Marlin (Frantar et al., 2024): the decode trick in
   the int4 MoE kernel and the draft head.
+- **Weight decode inside the GEMM**: Marlin's int4 kernels and ExLlamaV3's EXL3 GEMM, which decode quantized weights in
+  the matrix-multiply loop instead of materializing them. The prefill MoE kernels (`moe3p` for the RTX's trellis band,
+  `moe4p` for the int4 tiers) work this way.
 - **Stream-K** (Osama et al., 2023): work decomposition of the MoE kernels (int4 on the GB300, 3-bit trellis on the RTX)
   and the int8 GEMVs.
 - **Thread-block clusters with distributed shared memory** (Hopper/Blackwell programming guide): the cluster-reduced int8
