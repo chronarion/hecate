@@ -52,7 +52,7 @@ RUN mkdir -p /tmp/i8 && cp /tmp/p/apply_i8_linear.py /tmp/p/dense_i8.cu /tmp/i8/
 RUN python3 /tmp/p/fold/apply_fold.py ${EXT} /tmp/p/fold
 # 5. module graphs run eagerly while an outer (whole-forward) CUDA graph is being captured
 RUN python3 /tmp/p/vg_eager.py ${EXT}
-# 6. tcgen05 sparse attention for the MLA prefill (EXL3_HMLA_PREFILL)
+# 6. tcgen05 sparse attention for the MLA prefill and the long-context decode (EXL3_HMLA_PREFILL, EXL3_HMLA_DECODE)
 RUN python3 /tmp/p/hmla/apply_hmla.py ${EXT} ${SP} /tmp/p/hmla
 RUN cd /opt/exllamav3 && (MAX_JOBS=${MAX_JOBS} python setup.py build_ext > /tmp/build_ext.log 2>&1 \
       || (grep -B2 -A8 -E " error|Error" /tmp/build_ext.log | head -80; exit 1)) \
@@ -73,7 +73,7 @@ COPY config/ /opt/hecate/config/
 # Validated defaults (every switch is documented in docs/configuration.md; the report measures this exact set)
 ENV EXL3_MOE4_SRC=/opt/hecate/tier/moe4 EXL3_TIER_BUILD=/root/.cache/hecate-tier TRITON_CACHE_DIR=/root/.cache/triton \
     EXL3_PIN_EXPERTS=/opt/hecate/tier/pin-none.json \
-    EXL3_RTX_GRAPH=1 EXL3_RTX_STAGE=1 EXL3_RTX_MOE3=1 EXL3_HMLA_PREFILL=1 \
+    EXL3_RTX_GRAPH=1 EXL3_RTX_STAGE=1 EXL3_RTX_MOE3=1 EXL3_HMLA_PREFILL=1 EXL3_HMLA_DECODE=1 EXL3_HMLA_NS=16 \
     EXL3_TIER_CPU=1 EXL3_TIER_CPU_THREADS=60 EXL3_TIER_CPU_CORE0=12 EXL3_TIER_PREFILL_MOE4=1 EXL3_TIER_SH_FAST=1 \
     EXL3_EMBED_GPU=1 EXL3_DRAFT_HEAD_I4=1 EXL3_DRAFT_MAX_ROWS=8 EXL3_MTP_MERGE_GAP=1 \
     EXL3_UNFOLD_BV=32 EXL3_UNFOLD_CFG=2,4 EXL3_UNFOLD_BK=128 EXL3_ROUTER_DET=0 EXL3_BT_FINE=1 EXL3_INT8_SQ_MAX_M=4 \

@@ -29,7 +29,7 @@ GGUF or safetensors checkpoint.
 
 | | |
 |---|---|
-| Decode, concurrency 1 (10 prompts × 3 passes, greedy, MTP 3 drafts) | 138.4 tok/s |
+| Decode, concurrency 1 (10 prompts × 3 passes, greedy, MTP 3 drafts) | ~140 tok/s |
 | KL divergence vs BF16 (rtx6kpro protocol, 36,848 positions) | 0.0740 (see the benchmarks below) |
 | Context | 2 × 256K (Q6 KV) by default; one 1M-token conversation with the long-context profile |
 
@@ -52,6 +52,9 @@ GGUF or safetensors checkpoint.
   - per-expert Hessians shrunk toward the layer-wide input covariance;
   - down projections calibrated on the quantized gate/up output;
   - every layer calibrated on the states the quantized model produces up to it.
+
+  The last two follow [brandonmusic](https://huggingface.co/brandonmusic)'s published TR3 recipe for GLM EXL3 quants
+  (causal layer rebuild, down calibration on the reconstructed gate/up output).
 - **Warm tier.** ExLlamaV3's EXL3 quantizer (LDLQ trellis, K = 3) with the same per-expert Hessians, in the same pass.
 - **int8.** Per-row scale, with the clip chosen by MSE on each weight row.
 
@@ -63,37 +66,34 @@ driver 615.71, CUDA 13.0.
 
 Raw JSON and logs: [`benchmarks/`](https://github.com/chronarion/hecate/tree/main/benchmarks).
 
-#### Decode (llm-inference-bench: context 0, 30 s windows, ignore_eos, 2048 max tokens; aggregate tok/s)
+#### Decode, aggregate tok/s by context and concurrency (llm-inference-bench: 30 s windows, ignore_eos, 2048 max tokens; mean of the runs that measured the cell)
 
-| Concurrency | 1 | 2 | 4 | 8 | 16 | 32 |
+| Context | C=1 | C=2 | C=4 | C=8 | C=16 | C=32 |
 |---|---:|---:|---:|---:|---:|---:|
-| tok/s | 154.5 | 190.1 | 112.0 | 235.1 | 67.4 | 121.5 |
+| 0 | 135 | 186 | 113 | 240 | 68 | 122 |
+| 4K | 121 | 162 | 113 | 239 | - | - |
+| 16K | 119 | 175 | 111 | 240 | - | - |
+| 32K | 119 | 168 | 109 | 237 | - | - |
+| 64K | 116 | 158 | 107 | - | - | - |
+| 128K | 118 | 158 | - | - | - | - |
 
-Hecate is tuned for one or two conversations. From 4 concurrent requests the server trims MTP drafts to stay on the
-8-row decode fast path (4: one draft, 8: none); from 16 it leaves that path.
+Each request gets the aggregate divided by C. Hecate is tuned for one or two conversations: from 4 concurrent requests
+the server trims MTP drafts to stay on the 8-row decode fast path (4: one draft, 8: none); from 16 it leaves that path.
+Past 2,048 tokens of context the model's sparse attention (DSA) takes over. Single concurrency-1 cells vary by up to
+±10% between runs, because MTP acceptance depends on the generated text.
 
-#### Decode vs context (llm-inference-bench, concurrency 1, 30 s windows)
+#### Prefill (llm-inference-bench standalone cold prefill, mean of 2 rounds)
 
-| Context | 0 | 16K | 32K | 64K | 128K |
-|---|---:|---:|---:|---:|---:|
-| tok/s | 149.0 | 118.2 | 117.3 | 112.2 | 105.0 |
-
-Past 2,048 tokens of context the model's sparse attention (DSA) takes over, which accounts for the step from 0 to 16K.
-With MTP speculative decoding, concurrency-1 speed depends on the generated text (draft acceptance): the two context-0
-cells above come from different runs.
-
-#### Prefill (llm-inference-bench standalone cold prefill, 3 rounds)
-
-| Prompt | Round 1 | Round 2 | Round 3 |
-|---|---:|---:|---:|
-| 8K | 2,033 tok/s | 2,053 tok/s | 2,054 tok/s |
-| 64K | 1,986 tok/s | 1,989 tok/s | 1,987 tok/s |
+| Prompt | 1K | 4K | 8K | 16K | 32K | 64K | 128K |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Prefill tok/s | 570 | 1,479 | 2,073 | 2,088 | 2,088 | 2,014 | 1,904 |
+| Time to first token | 2.0 s | 2.8 s | 4.0 s | 7.8 s | 15.5 s | 32.0 s | 67.7 s |
 
 #### Our speed test
 
-10 chat prompts × 3 passes, greedy, 400 tokens, concurrency 1: **138.4 tok/s** (138.6 / 138.2 / 138.5). A 27.6K-token
-prompt: prefill 1,363 tok/s, then 120 tok/s decode; a 109K-token prompt: prefill 1,878 tok/s, then 115 tok/s. With the 1M
-profile, a 375K-token prompt: prefill 1,507 tok/s, then 67 tok/s.
+10 chat prompts × 3 passes, greedy, 400 tokens, concurrency 1: **~140 tok/s** (140.3 / 142.6 / 142.9 on release 2;
+138.4 on release 1, same short-context path). A 27.6K-token prompt: prefill 1,930 tok/s, then 133 tok/s decode; a
+109K-token prompt: prefill 1,880 tok/s, then 125 tok/s.
 
 #### KLD compared with other GLM-5.3 quants
 

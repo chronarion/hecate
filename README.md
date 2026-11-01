@@ -1,7 +1,7 @@
 # Hecate: Hybrid Inference and Quantization for DGX Station (ExLlamaV3)
 
 Hecate serves **GLM-5.3 (753B MoE)** on a single **NVIDIA DGX Station GB300** at concurrency-1 decode speeds of
-**~138 tok/s** (stock model, MTP speculative decoding, 2 × 256K context). Its KL divergence to the BF16 model is lower
+**~140 tok/s** (stock model, MTP speculative decoding, 2 × 256K context). Its KL divergence to the BF16 model is lower
 than the published 3-bit EXL3 quant's.
 
 The model does not fit in any one memory of the machine. Hecate splits every MoE layer across all three processors at
@@ -21,12 +21,42 @@ release, [zai-org/GLM-5.3-BF16](https://huggingface.co/zai-org/GLM-5.3-BF16).
 
 | | Value |
 |---|---|
-| Decode, concurrency 1, 10 prompts × 3 passes, greedy, 400 tokens | **138.4 tok/s** (stock) |
-| Decode vs context (llm-inference-bench, C=1, 30 s windows) | 16K: 118 · 32K: 117 · 64K: 112 · 128K: 105 tok/s |
-| One long prompt, then 300 tokens of decode | 27.6K: 1,363 tok/s prefill, 120 tok/s decode · 109K: 1,878 / 115 · 375K (1M profile): 1,507 / 67 |
-| Prefill (llm-inference-bench standalone, cold, 3 rounds) | 8K: 2.05K tok/s · 64K: 1.99K tok/s |
+| Decode, concurrency 1, 10 prompts × 3 passes, greedy, 400 tokens | **~140 tok/s** (stock; 138-143 across the release test runs) |
+| Decode vs context (llm-inference-bench, C=1, mean of 3 runs) | 16K: 119 · 32K: 119 · 64K: 116 · 128K: 118 tok/s |
+| One long prompt, then 300 tokens of decode | 27.6K: 1,930 tok/s prefill, 133 tok/s decode · 109K: 1,880 / 125 |
+| Prefill (llm-inference-bench standalone, cold) | ~2,080 tok/s at 8K-32K, 2,010 at 64K, 1,900 at 128K |
 | KL divergence vs BF16 (rtx6kpro protocol, 36,848 positions) | **0.0740** (published EXL3 3.0 bpw: 0.1013) |
 | Context | 2 × 256K Q6 KV by default; a single 1M-token conversation with the long-context profile |
+
+## Benchmarks
+
+local-inference-lab `llm-inference-bench` v0.8.0 on the release image: 30 s decode windows, ignore_eos, 2048 max tokens,
+the default 512K-token KV pool (cells that would not fit in it are skipped). Raw JSON and logs:
+[`benchmarks/`](benchmarks/), invocations in [`tools/bench/llm_inference_bench.sh`](tools/bench/llm_inference_bench.sh).
+
+**Decode, aggregate tok/s by context and concurrency** (mean of the runs that measured the cell; C=1 cells from 2-3 runs):
+
+| Context | C=1 | C=2 | C=4 | C=8 | C=16 | C=32 |
+|---|---:|---:|---:|---:|---:|---:|
+| 0 | 135 | 186 | 113 | 240 | 68 | 122 |
+| 4K | 121 | 162 | 113 | 239 | - | - |
+| 16K | 119 | 175 | 111 | 240 | - | - |
+| 32K | 119 | 168 | 109 | 237 | - | - |
+| 64K | 116 | 158 | 107 | - | - | - |
+| 128K | 118 | 158 | - | - | - | - |
+
+Each request gets the aggregate divided by C. Hecate is tuned for one or two conversations: from 4 concurrent requests
+it trims MTP drafts to stay on the 8-row decode fast path (4: one draft, 8: none), and from 16 it leaves that path.
+Single C=1 cells vary by up to ±10% between runs, because MTP acceptance depends on the generated text.
+
+**Prefill, standalone and cold** (one request, mean of 2 rounds; time to first token includes the first decode step):
+
+| Prompt | 1K | 4K | 8K | 16K | 32K | 64K | 128K |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Prefill tok/s | 570 | 1,479 | 2,073 | 2,088 | 2,088 | 2,014 | 1,904 |
+| Time to first token | 2.0 s | 2.8 s | 4.0 s | 7.8 s | 15.5 s | 32.0 s | 67.7 s |
+
+Short prompts pay a fixed ~1.7 s, so time to first token is 2.0 s even at 1K tokens.
 
 ## What made it fast
 
@@ -50,13 +80,16 @@ credits public work the change builds on; "—" means it came out of profiling t
 | MoE cooperative-kernel tweaks | 2 blocks per SM (+1.1%), guard-free ring-2 main loop (+4.8%), 3-bit affine fold with fp32 MMA (+2.1%) | +8% | — |
 | DSA indexer top-k on one block over the live width | replaces a split + merge path chosen by the static width | +5.6% at 23K context | — |
 | Trellis MoE kernel for the RTX (`moe3`) | the RTX band's 3-bit experts run stream-K with the decoded trellis tile as the MMA A operand, so the token rows fill the n8 side (one MMA per tile, no padded rows); weights stream through a cp.async ring; kernels chain with programmatic dependent launch. 80 → 55 µs per MoE layer | +1.5% | [Stream-K](https://arxiv.org/abs/2301.03598); EXL3 trellis codebook ([QTIP](https://arxiv.org/abs/2406.11235), ExLlamaV3) |
-| tcgen05 sparse attention for prefill (`hmla`) | the DSA attention of prompt chunks as one Blackwell tensor-core (UMMA / TMEM) kernel per query row: all 64 heads per CTA, Q held in TMEM, the gathered Q6 rows dequantized once into swizzled shared memory, double-buffered K tiles, warp-specialized load / MMA / softmax roles. 2.2x the Triton kernel it replaces | +8-11% prefill at 27K-109K context | [FlashMLA](https://github.com/deepseek-ai/FlashMLA) SM100 kernels (mechanics) |
+| tcgen05 sparse attention for prefill and long-context decode (`hmla`) | the DSA attention (contexts past 2,048 tokens) as one Blackwell tensor-core (UMMA / TMEM) kernel: all 64 heads per CTA, Q held in TMEM, the gathered Q6 rows dequantized once into swizzled shared memory, double-buffered K tiles, warp-specialized load / MMA / softmax roles. Prefill: one CTA per query row, 2.2x the Triton kernel; decode: each row's 2,048 selected keys split across 16 CTAs plus a combine. Shorter contexts keep the Triton kernels, which are faster there | +8-11% prefill at 27K-109K; decode +3-5% past 16K (attention 35 → 24 µs per layer) | [FlashMLA](https://github.com/deepseek-ai/FlashMLA) SM100 kernels (mechanics) |
 | RTX prefill: in-place reconstruct | the RTX's prefill dequantizes each expert group straight into one reused stacked buffer instead of stacking copies | +15% prefill (8K chunks) | — |
 | Smaller wins | token embedding in HBM (removes a host sync per draft), int4 draft LM head, MTP layer in int4, fused shared-expert gate + up + SiLU, shared expert straight into the hot-tier accumulator | +1-3% each | int4 draft-only LM head: [b12x](https://github.com/local-inference-lab/b12x) |
 
 **Fidelity.** These changes made the model closer to BF16 than the published 3-bit quant, not just faster:
 - the int4 tiers are GPTQ-requantized from BF16, calibrated on the states of the quantized model, layer by layer;
 - the warm RTX tier is requantized from BF16 the same way;
+- the calibration follows [brandonmusic](https://huggingface.co/brandonmusic)'s published TR3 recipe for GLM EXL3
+  quants: the layers are rebuilt causally (each one calibrated on the output of the already-quantized layers before
+  it), and each expert's down projection is calibrated on its reconstructed, quantized gate/up output;
 - the attention projections, shared experts, dense MLPs and LM head are int8 straight from BF16; the router, DSA
   indexer, kv_b_proj and the MTP eh_proj stay FP16.
 

@@ -10,7 +10,7 @@ module is done, so ~60 GB of local disk is enough.
 |---|---|---|---|
 | 1. routing log + popularity ranks | (served-model routing log, 2,599 verify steps) | `rank.json` | — |
 | 2. placement | `placement/tier_placement.py rank.json 144 85 …` (`FAR=1`), `placement/kv_placement.py` for larger KV pools | `placement/*.json` | — |
-| 3. int4 hot + cold tiers (GPTQ, causal state propagation) | `quant/gptq_int4.py` | `int4/layer{L}.safetensors`, `layer{L}.r229.safetensors` | ~2 h |
+| 3. int4 hot + cold tiers (GPTQ, causal state propagation and down calibration on the quantized gate/up output, after brandonmusic's TR3 recipe) | `quant/gptq_int4.py` | `int4/layer{L}.safetensors`, `layer{L}.r229.safetensors` | ~2 h |
 | 4. warm tier (3-bit EXL3 trellis, same calibration) | `quant/requant_rtx_band.py` | `rtx-band/layer{L}.safetensors` | several hours |
 | 5. int8 non-expert linears | `quant/build_int8.py` | `int8/{layer}.safetensors` | CPU, minutes |
 | 6. base folder (unquantized tensors, virtual tensor list, config, tokenizer) | `quant/build_skeleton.py` | `base/` | CPU, minutes |

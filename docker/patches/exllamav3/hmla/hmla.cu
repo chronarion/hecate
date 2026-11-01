@@ -1,24 +1,20 @@
-// hecate: tcgen05 (UMMA / TMEM) sparse attention for GLM-5.3's MLA prefill over ExLlamaV3's Q6 latent cache, sm_103a.
-// Replaces the DSA gather kernel of long prompt chunks (EXL3_HMLA_PREFILL): out = softmax(q K^T) K over each query row's
-// top-k selected cache rows (V is the latent part of K), for all 64 heads of the row at once.
+// hecate: tcgen05 (UMMA / TMEM) attention for GLM-5.3's MLA over ExLlamaV3's Q6 latent cache, sm_103a: the DSA sparse
+// attention of decode steps (graph-aware launcher, key list split across ns CTAs + combine) and of prefill chunks (one CTA
+// per query row). The dense regime (contexts up to index_topk) stays on the Triton kernels, which are faster there.
 //
-// CTA = one query row x 64 heads, 416 threads:
-//   warps 0-3  softmax (TMEM lane quadrants): the two S halves summed through shared memory, online softmax (rescale only
-//              when the running maximum grows by more than 2^8), P (fp16) into shared memory, O rescaled in TMEM, epilogue
-//              (normalize, inverse per-32 Hadamard rotation, store)
-//   warps 4-11 loads: Q (rotated) staged once; then two halves of 4 warps alternate 64-token tiles (half h fills K tile
-//              h), gathering the packed Q6 rows straight from global memory (issued before the buffer wait, so their
-//              latency overlaps it) and dequantizing them into a K-major SW128 tile; cache slots resolved four tiles ahead
-//   warp 12    TMEM allocation; lane 0 copies Q into TMEM (tcgen05.cp) and issues every tcgen05.mma from an event loop
-//              (QK of the next tile and PV of the previous one as soon as their inputs are ready)
-// Dual-half layout (as in FlashMLA's SM100 kernels): a .ws M64 N128 MMA reads A from TMEM lanes 0-63 for n < 64 and lanes
+// CTA = one query row x 64 heads x one split of the row's key list (dense: [0, seqlen + r]; sparse: indices[r][0, k_len),
+// -1 = padding). 416 threads:
+//   warps 0-3  softmax WG (TMEM lane quadrants): S halves summed through shared memory, online softmax (lazy rescale),
+//              P (fp16) into shared memory, O rescale in TMEM, epilogue (normalize, inverse per-32 rotation, store)
+//   warps 4-11 load WG: Q (rotated) staged once; per 64-token tile, cache slots two tiles ahead, then the packed Q6 rows
+//              read straight from global memory and dequantized into one of two K tiles
+//   warp 12    TMEM allocation; lane 0 copies Q into TMEM (tcgen05.cp) and issues every tcgen05.mma
+// Dual-half layout (FlashMLA's trick for 64 heads): a .ws M64 N128 MMA reads A from TMEM lanes 0-63 for n < 64 and lanes
 // 64-127 for n >= 64, and B rows 0-63 / 64-127 respectively. Q's even 64-dim atoms sit in lanes 0-63 and its odd atoms in
-// lanes 64-127; the K tile (64 tokens x 8 atoms, K-major SW128, 8 KB atom columns) read as 128 rows x 4 atom-column pairs
-// splits the same way, so one MMA yields two partial dot products of 64 tokens; the 64 rope dims split 32 / 32 (K-major
-// SW64). S = the sum of the two halves. V = the K tile's latent part read MN-major (SW128, 64-row view).
+// lanes 64-127; the K tile (64 tokens x 8 atoms, K-major SW128, atom column stride 8 KB) read as 128 rows x 4 atom-column
+// pairs gives the same split. One MMA = two partial dot products of 64 tokens; the rope 64 dims split 32 / 32 the same way
+// (K-major SW64). S = sum of the two halves. V = the K tile's latent read MN-major SW128 (64-row view).
 // TMEM: O cols 0..255 (.ws M64 N256 x 2), Q cols 256..399, S cols 400..463.
-// Q6 cache: per token 16 groups of 32 values, 6 int32 words each (4-bit plane: word v/8, shift (v%8)*4; 2-bit plane:
-// word 4 + v/16, shift (v%16)*2), value = (raw - 31.5) * scale / 32, in the per-32 rotated domain.
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -131,7 +127,7 @@ __device__ __forceinline__ uint32_t prmt(uint32_t a, uint32_t b, uint32_t sel)
 {
     uint32_t r; asm("prmt.b32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(sel)); return r;
 }
-__device__ __forceinline__ void deq_group(const uint32_t* wd, float scale, uint4* o)
+__device__ __forceinline__ void deq_group_fast(const uint32_t* wd, float scale, uint4* o)
 {
     const __half2 s2 = __float2half2_rn(scale * (1.f / 32.f));
     const __half2 b2 = __float2half2_rn(-0.5f * scale * (1.f / 32.f));
@@ -154,25 +150,46 @@ __device__ __forceinline__ void deq_group(const uint32_t* wd, float scale, uint4
         o[k] = make_uint4(h[0], h[1], h[2], h[3]);
     }
 }
+// reference form (kept for the slow path)
+__device__ __forceinline__ void deq_group(const uint32_t* wd, float scale, uint4* o)
+{
+    const float sc = scale * (1.f / 32.f), off = -31.5f * sc;
+    uint32_t hv[16];
+    #pragma unroll
+    for (int v = 0; v < 32; v += 2)
+    {
+        const uint32_t r0 = (((wd[v >> 3] >> ((v & 7) * 4)) & 15) << 2) | ((wd[4 + (v >> 4)] >> ((v & 15) * 2)) & 3);
+        const uint32_t r1 = (((wd[(v + 1) >> 3] >> (((v + 1) & 7) * 4)) & 15) << 2) | ((wd[4 + ((v + 1) >> 4)] >> (((v + 1) & 15) * 2)) & 3);
+        hv[v >> 1] = pack_h2(fmaf((float) r0, sc, off), fmaf((float) r1, sc, off));
+    }
+    #pragma unroll
+    for (int u = 0; u < 4; ++u) o[u] = make_uint4(hv[4 * u], hv[4 * u + 1], hv[4 * u + 2], hv[4 * u + 3]);
+}
+
 __global__ void __launch_bounds__(NT, 1) hmla_kernel(const half* __restrict__ q_lat, const half* __restrict__ q_pe,
     const int* __restrict__ ckv, const half* __restrict__ ckv_s, const half* __restrict__ kpe, const int* __restrict__ bt,
-    const int* __restrict__ idx, int k_pad, int R, float sl2, half* __restrict__ out)
+    const int* __restrict__ idx, const int* __restrict__ seqlens, int bt_stride, int k_pad, int k_len, int seqlen_h, int R,
+    int rot_q, float sl2, int ns, half* __restrict__ out, float* __restrict__ part_o, float* __restrict__ part_ml, int dbg)
 {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1200   // tcgen05: sm_100 family (the RTX build gets an empty body)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1200   // tcgen05: sm_100 family only (the RTX build gets an empty body)
     extern __shared__ __align__(1024) unsigned char smem[];
-    const int r = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int r = blockIdx.y, split = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     unsigned char* Kt[2] = {smem + SM_K0, smem + SM_K1};
     unsigned char* Ps = smem + SM_P;
     float* XB = (float*) (smem + SM_XB); float* XS = (float*) (smem + SM_XS); int* RING = (int*) (smem + SM_RING);
     const uint32_t bq = su32(smem + SM_BAR), bqcp = bq + 8, bk0 = bq + 16, bs = bq + 32, bsf = bq + 40, bp = bq + 48, bo0 = bq + 56;
     uint32_t* tm_base = (uint32_t*) (smem + SM_TM);
 
-    const int ntiles = (k_pad + TT - 1) / TT;
-    auto slot_of = [&](int j) -> int                      // cache slot of list entry j (block table row 0: one sequence)
+    const int seqlen = seqlens ? __ldg(seqlens) : seqlen_h;
+    const int total = idx ? k_len : seqlen + r + 1;
+    const int chunk = ((total + ns - 1) / ns + TT - 1) / TT * TT;
+    const int j0 = split * chunk, j1 = min(j0 + chunk, total);
+    const int ntiles = j1 > j0 ? (j1 - j0 + TT - 1) / TT : 0;
+    auto slot_of = [&](int j) -> int
     {
-        if (j >= k_pad) return -1;
-        const int e = __ldg(idx + (size_t) r * k_pad + j);
-        return e < 0 ? -1 : __ldg(bt + e / PAGE) * PAGE + e % PAGE;
+        if (j >= j1) return -1;
+        const int e = idx ? __ldg(idx + (size_t) r * k_pad + j) : j;
+        return e < 0 ? -1 : __ldg(bt + (size_t) r * bt_stride + e / PAGE) * PAGE + e % PAGE;
     };
 
     if (tid == 0)
@@ -185,7 +202,7 @@ __global__ void __launch_bounds__(NT, 1) hmla_kernel(const half* __restrict__ q_
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 512;" :: "r"(su32(tm_base)) : "memory");
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::: "memory");
     }
-    if (tid < 256) { const int t = tid >> 6, i = tid & 63; if (t < ntiles) RING[t * 64 + i] = slot_of(t * TT + i); }
+    if (tid < 256) { const int t = tid >> 6, i = tid & 63; if (t < ntiles) RING[t * 64 + i] = slot_of(j0 + t * TT + i); }
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     tc_fence_before();
     __syncthreads();
@@ -206,6 +223,7 @@ __global__ void __launch_bounds__(NT, 1) hmla_kernel(const half* __restrict__ q_
                 const uint4* src = (const uint4*) (q_lat + ((size_t) h * R + r) * DC + b * 32);
                 #pragma unroll
                 for (int i = 0; i < 4; ++i) v[i] = __ldg(src + i);
+                if (rot_q)
                 {
                     float x[32];
                     #pragma unroll
@@ -244,7 +262,7 @@ __global__ void __launch_bounds__(NT, 1) hmla_kernel(const half* __restrict__ q_
             const int buf = hh;
             const int* sl = RING + (t & 7) * 64;
             uint32_t wd[8][6]; float scv[8]; uint4 rp[4];
-            // gathers first: their latency overlaps the buffer wait
+            if (!(dbg & 1))                                // gathers first: their latency overlaps the buffer wait
             {
                 #pragma unroll
                 for (int u = 0; u < 8; ++u)
@@ -265,14 +283,15 @@ __global__ void __launch_bounds__(NT, 1) hmla_kernel(const half* __restrict__ q_
             }
             if (t >= 2) bar_wait(bo0 + 8 * buf, ((t - 2) >> 1) & 1);      // PV(t-2) done: tile buffer and ring slot free
             if (t == 1) bar_wait(bqcp, 0);                                 // Q copied out of tile buffer 1
-            if (ht < 64 && t + 4 < ntiles) RING[((t + 4) & 7) * 64 + ht] = slot_of((t + 4) * TT + ht);
+            if (ht < 64 && t + 4 < ntiles) RING[((t + 4) & 7) * 64 + ht] = slot_of(j0 + (t + 4) * TT + ht);
+            if (!(dbg & 1))
             {
                 #pragma unroll
                 for (int u = 0; u < 8; ++u)
                 {
                     const int c = ht + u * 128, ti = c >> 4, gi = c & 15;
                     uint4 o[4];
-                    deq_group(wd[u], scv[u], o);
+                    deq_group_fast(wd[u], scv[u], o);
                     #pragma unroll
                     for (int q = 0; q < 4; ++q) *(uint4*) (Kt[buf] + lat_off(ti, gi * 32 + q * 8)) = o[q];
                 }
@@ -309,6 +328,7 @@ __global__ void __launch_bounds__(NT, 1) hmla_kernel(const half* __restrict__ q_
                 {
                     tc_fence_after();
                     const uint32_t ka = su32(Kt[nq & 1]);
+                    if (!(dbg & 2))
                     {
                         #pragma unroll
                         for (int s = 0; s < 16; ++s)
@@ -325,6 +345,7 @@ __global__ void __launch_bounds__(NT, 1) hmla_kernel(const half* __restrict__ q_
                 {
                     tc_fence_after();
                     const uint32_t ka = su32(Kt[np_ & 1]);
+                    if (!(dbg & 4))
                     {
                         #pragma unroll
                         for (int s = 0; s < 4; ++s)
@@ -391,7 +412,7 @@ __global__ void __launch_bounds__(NT, 1) hmla_kernel(const half* __restrict__ q_
             {
                 bar_wait(bo0 + 8 * ((t - 1) & 1), ((t - 1) >> 1) & 1);     // PV(t-1) done: O stable, P free
                 tc_fence_after();
-                if (__any_sync(0xffffffffu, alpha != 1.f))
+                if (!(dbg & 8) && __any_sync(0xffffffffu, alpha != 1.f))
                 {
                     #pragma unroll
                     for (int c = 0; c < 256; c += 32)
@@ -421,7 +442,7 @@ __global__ void __launch_bounds__(NT, 1) hmla_kernel(const half* __restrict__ q_
         named_bar(2, 128);
         const float lt_ = l + XS[(part ^ 1) * 64 + row];
         if (ntiles > 0) { bar_wait(bo0 + 8 * ((ntiles - 1) & 1), ((ntiles - 1) >> 1) & 1); tc_fence_after(); }
-        const float f = lt_ > 0.f ? 1.f / lt_ : 0.f;
+        const float f = (ns == 1) ? (lt_ > 0.f ? 1.f / lt_ : 0.f) : 1.f;
         #pragma unroll 1
         for (int c = 0; c < 256; c += 32)
         {
@@ -430,12 +451,26 @@ __global__ void __launch_bounds__(NT, 1) hmla_kernel(const half* __restrict__ q_
             if (ntiles > 0) { TLD32(o, tmem + lanes + TM_O + c); tld_wait(); }
             #pragma unroll
             for (int j = 0; j < 32; ++j) x[j] = ntiles > 0 ? __uint_as_float(o[j]) * f : 0.f;
-            const int d0 = (c >> 7) * 256 + part * 128 + (c & 127);       // 32 contiguous latent dims of this row
-            wht32r(x);                                     // back from the cache's rotated domain
-            uint4* dst = (uint4*) (out + ((size_t) row * R + r) * DC + d0);
-            #pragma unroll
-            for (int i = 0; i < 4; ++i)
-                dst[i] = make_uint4(pack_h2(x[i * 8], x[i * 8 + 1]), pack_h2(x[i * 8 + 2], x[i * 8 + 3]), pack_h2(x[i * 8 + 4], x[i * 8 + 5]), pack_h2(x[i * 8 + 6], x[i * 8 + 7]));
+            const int d0 = (c >> 7) * 256 + part * 128 + (c & 127);
+            if (ns == 1)
+            {
+                wht32r(x);
+                uint4* dst = (uint4*) (out + ((size_t) row * R + r) * DC + d0);
+                #pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    dst[i] = make_uint4(pack_h2(x[i * 8], x[i * 8 + 1]), pack_h2(x[i * 8 + 2], x[i * 8 + 3]), pack_h2(x[i * 8 + 4], x[i * 8 + 5]), pack_h2(x[i * 8 + 6], x[i * 8 + 7]));
+            }
+            else
+            {
+                float4* dst = (float4*) (part_o + (((size_t) split * R + r) * H + row) * DC + d0);
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) dst[i] = make_float4(x[4 * i], x[4 * i + 1], x[4 * i + 2], x[4 * i + 3]);
+            }
+        }
+        if (ns > 1 && part == 0)
+        {
+            float* pm = part_ml + (((size_t) split * R + r) * H + row) * 2;
+            pm[0] = ntiles > 0 ? m : -1e30f; pm[1] = lt_;
         }
         tc_fence_before();
     }
@@ -447,23 +482,78 @@ __global__ void __launch_bounds__(NT, 1) hmla_kernel(const half* __restrict__ q_
     }
 #endif
 }
+
+__global__ void hmla_combine(const float* __restrict__ part_o, const float* __restrict__ part_ml, half* __restrict__ out, int ns, int R)
+{
+    const int r = blockIdx.x / H, h = blockIdx.x % H, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    float M = -1e30f;
+    for (int s = 0; s < ns; ++s) M = fmaxf(M, part_ml[(((size_t) s * R + r) * H + h) * 2]);
+    float L = 0.f, acc = 0.f;
+    for (int s = 0; s < ns; ++s)
+    {
+        const float* pm = part_ml + (((size_t) s * R + r) * H + h) * 2;
+        const float wgt = exp2f(pm[0] - M);
+        L += wgt * pm[1];
+        acc += wgt * part_o[(((size_t) s * R + r) * H + h) * DC + w * 32 + lane];
+    }
+    float v = L > 0.f ? acc / L : 0.f;
+    #pragma unroll
+    for (int b = 1; b < 32; b <<= 1) { const float p = __shfl_xor_sync(0xffffffffu, v, b); v = (lane & b) ? p - v : v + p; }
+    out[((size_t) h * R + r) * DC + w * 32 + lane] = __float2half(v * 0.17677669529663687f);
+}
 }  // namespace
 
-// q_lat (H, R, 512) fp16 (unrotated absorbed queries), q_pe (R, H, 64); ckv (pages, 256, 96) int32, ckv_s (pages, 256, 16)
-// fp16, kpe (pages, 256, [1,] 64) fp16; block_table (1, pages) int32; indices (R, k_pad) int32, -1 = padding; out (H, R, 512)
-void hmla_attn(at::Tensor q_lat, at::Tensor q_pe, at::Tensor ckv, at::Tensor ckv_s, at::Tensor kpe, at::Tensor block_table,
-               at::Tensor indices, double scale, at::Tensor out)
+
+static void hmla_launch(const at::Tensor& q_lat, const at::Tensor& q_pe, const at::Tensor& ckv, const at::Tensor& ckv_s,
+                        const at::Tensor& kpe, const at::Tensor& block_table, const int* idx, int k_pad, float scale,
+                        at::Tensor& out, int ns, cudaStream_t stream, Graph* graph)
 {
-    const at::cuda::OptionalCUDAGuard guard(q_lat.device());
     const int R = (int) q_lat.size(1);
-    const int64_t slots = kpe.numel() / DR;
-    TORCH_CHECK(q_lat.size(0) == H && q_lat.size(2) == DC && q_pe.numel() == (int64_t) R * H * DR && ckv.numel() == slots * 96 &&
-                ckv_s.numel() == slots * 16 && indices.dim() == 2 && indices.size(0) == R && block_table.size(0) == 1 &&
-                q_lat.is_contiguous() && q_pe.is_contiguous() && indices.is_contiguous() && block_table.is_contiguous(), "hmla_attn: shapes");
+    const int slots = (int) (kpe.numel() / DR);
+    TORCH_CHECK(q_lat.size(0) == H && q_lat.size(2) == DC && ckv.numel() == (int64_t) slots * 96 && ckv_s.numel() == (int64_t) slots * 16,
+                "hmla: shapes");
     static bool attr = [] { cudaFuncSetAttribute(hmla_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SM_END); return true; }();
     (void) attr;
-    hmla_kernel<<<R, NT, SM_END, at::cuda::getCurrentCUDAStream().stream()>>>((const half*) q_lat.data_ptr(), (const half*) q_pe.data_ptr(),
+    // split partials: one workspace per device, sized for 16 splits x 8 rows, allocated on the first (eager) call
+    static at::Tensor ws_o[16], ws_ml[16];
+    float* po = nullptr; float* pml = nullptr;
+    if (ns > 1)
+    {
+        TORCH_CHECK(ns <= 16 && R <= 8, "hmla: ns / rows");
+        const int d = q_lat.device().index();
+        if (!ws_o[d].defined())
+        {
+            ws_o[d] = at::empty({16 * 8 * H * DC}, q_lat.options().dtype(at::kFloat));
+            ws_ml[d] = at::empty({16 * 8 * H * 2}, q_lat.options().dtype(at::kFloat));
+        }
+        po = ws_o[d].data_ptr<float>(); pml = ws_ml[d].data_ptr<float>();
+    }
+    hmla_kernel<<<dim3((unsigned) ns, (unsigned) R), NT, SM_END, stream>>>((const half*) q_lat.data_ptr(), (const half*) q_pe.data_ptr(),
         (const int*) ckv.data_ptr(), (const half*) ckv_s.data_ptr(), (const half*) kpe.data_ptr(), (const int*) block_table.data_ptr(),
-        (const int*) indices.data_ptr(), (int) indices.size(1), R, (float) scale * 1.4426950408889634f, (half*) out.data_ptr());
-    cuda_check(cudaPeekAtLastError());
+        idx, nullptr, 0, k_pad, k_pad, 0, R, 1, scale * 1.4426950408889634f, ns, (half*) out.data_ptr(), po, pml, 0);
+    if (graph)
+    {
+        graph->record_param((void*) hmla_kernel, GP_attn_block_table, 5);
+        graph->record_param((void*) hmla_kernel, GP_dsa_indices, 6);
+        graph->record_param((void*) hmla_kernel, GP_end, 0);
+    }
+    if (ns > 1)
+        hmla_combine<<<R * H, 512, 0, stream>>>(po, pml, (half*) out.data_ptr(), ns, R);
+}
+
+void hmla_sparse_gr(const at::Tensor& q_lat, const at::Tensor& q_pe, const at::Tensor& ckv, const at::Tensor& ckv_s,
+                    const at::Tensor& kpe, const at::Tensor& block_table, const at::Tensor& indices, float scale, at::Tensor& out,
+                    int ns, cudaStream_t stream, Graph* graph)
+{
+    hmla_launch(q_lat, q_pe, ckv, ckv_s, kpe, block_table, (const int*) indices.data_ptr(), (int) indices.size(1), scale, out, ns,
+                stream, graph);
+}
+
+// Python entry (prefill sparse attention): one sequence, one CTA per query row (ns = 1)
+void hmla_attn(at::Tensor q_lat, at::Tensor q_pe, at::Tensor ckv, at::Tensor ckv_s, at::Tensor kpe, at::Tensor block_table,
+               at::Tensor indices, double scale, int64_t ns, at::Tensor out)
+{
+    const at::cuda::OptionalCUDAGuard guard(q_lat.device());
+    hmla_launch(q_lat, q_pe, ckv, ckv_s, kpe, block_table, (const int*) indices.data_ptr(), (int) indices.size(1), (float) scale, out,
+                (int) ns, at::cuda::getCurrentCUDAStream().stream(), nullptr);
 }

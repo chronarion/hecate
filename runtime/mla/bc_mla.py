@@ -166,6 +166,9 @@ class BCMLA:
             xh = xh,
             h32 = h32,
         )
+        # hecate: tcgen05 sparse decode attention (EXL3_HMLA_DECODE=1; EXL3_HMLA_NS CTAs per query row), see hmla.cu
+        if _os.environ.get("EXL3_HMLA_DECODE", "1") == "1" and self.quant and self.k_bits == 6:
+            self.bc.set_hmla(float(self.sm_scale), int(_os.environ.get("EXL3_HMLA_NS", "16")))
 
         # DSA lightning indexer (GLM-5.2). Full layers project/norm/rope/append keys every
         # step and score + select in the sparse regime; shared layers gather through an

@@ -1,6 +1,7 @@
 #!/bin/bash
-# local-inference-lab/llm-inference-bench v0.8.0, the invocations of its GLM scripts: decode matrix (C=1..32, 30 s), standalone
-# prefill (8K / 64K, 3 rounds after a warm-up) and the C=1 context sweep (0-128K). Client in a throwaway python container.
+# local-inference-lab/llm-inference-bench v0.8.0: decode across concurrency x context (C=1..8 x 0-128K, cells over the 512K
+# KV pool skipped; C=16 / 32 at context 0), standalone prefill from 1K to 128K (2 rounds after a warm-up) and the C=1
+# context sweep. 30 s decode windows, 2048 max tokens. Client in a throwaway python container.
 #   SRC=/path/to/llm-inference-bench OUT=./results bash llm_inference_bench.sh
 OUT=${OUT:-$PWD/llmbench-out}; SRC=${SRC:?path to a llm-inference-bench checkout (v0.8.0)}; mkdir -p $OUT; L=$OUT/bench.log
 echo "### bench start $(date +%T) server $(docker inspect -f '{{.Config.Image}}' hecate)" >> $L
@@ -17,10 +18,11 @@ B() {  # B LABEL ARGS...
 }
 B decode --skip-prefill --contexts 0 --concurrency 1,2,4,8,16,32 --duration 30 --max-tokens 2048
 B prefill-warm --prefill-only --standalone-prefill --prefill-contexts 64k --prefill-duration 10 --token-targeting estimate --max-tokens 1
-for r in 1 2 3; do
-  B prefill-r$r --prefill-only --standalone-prefill --prefill-contexts 8k,64k --prefill-duration 10 --token-targeting estimate --max-tokens 1
+for r in 1 2; do
+  B prefill-r$r --prefill-only --standalone-prefill --prefill-contexts 1k,4k,8k,16k,32k,64k,128k --prefill-duration 10 --token-targeting estimate --max-tokens 1
   sleep 10
 done
 B ctxsweep --skip-prefill --contexts 0,16k,32k,64k,128k --concurrency 1 --duration 30 --max-tokens 2048
+B matrix --skip-prefill --contexts 4k,16k,32k,64k,128k --concurrency 1,2,4,8 --duration 30 --max-tokens 2048
 docker logs hecate 2>&1 | grep -E "Traceback|out of memory|RuntimeError" | tail -3 >> $L
 echo "### bench done $(date +%T)" >> $L
