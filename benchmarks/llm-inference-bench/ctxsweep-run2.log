@@ -26,14 +26,14 @@ engine-specific probes and Prometheus diagnostics are disabled. Using
 OpenAI-stream-only measurement.
 Model context length: 262,144 tokens
 Prefill tests: skipped
-Calibrating padding text (run=osgtudqrpqnc, up to 128k)...
+Calibrating padding text (run=ypcopxsqkgnn, up to 128k)...
   Token targeting: single-point estimate from 8k (use --token-targeting exact 
 for /tokenize binary search)
   Calibrated: 6.18 chars/token (from 8k probe)
-  16k: 101,196 chars (~16,383 tokens)
-  32k: 202,393 chars (~32,767 tokens)
-  64k: 404,786 chars (~65,535 tokens)
-  128k: 809,572 chars (~131,071 tokens)
+  16k: 101,176 chars (~16,383 tokens)
+  32k: 202,352 chars (~32,767 tokens)
+  64k: 404,705 chars (~65,535 tokens)
+  128k: 809,411 chars (~131,071 tokens)
 Done.
 
 
@@ -45,16 +45,16 @@ llm-decode-bench v0.8.0
 │ concurrency and passed warmup. Use this as the main tuning/regression signal │
 │ for kernels, NCCL, DCP, MTP, and scheduler changes.                          │
 ╰──────────────────────────────────────────────────────────────────────────────╯
-Aggregate tok/s  + TTFT/ITL  
-╭────────────┬──────────────╮
-│ ctx \ conc │            1 │
-├────────────┼──────────────┤
-│ 0          │ 174.9 157/16 │
-│ 16k        │  124.8 92/17 │
-│ 32k        │  115.9 92/18 │
-│ 64k        │  113.9 95/18 │
-│ 128k       │ 112.7 100/18 │
-╰────────────┴──────────────╯
+Aggregate tok/s  + TTFT/ITL 
+╭────────────┬─────────────╮
+│ ctx \ conc │           1 │
+├────────────┼─────────────┤
+│ 0          │  150.9 81/8 │
+│ 16k        │ 155.1 86/14 │
+│ 32k        │  136.6 98/8 │
+│ 64k        │ 151.3 90/15 │
+│ 128k       │ 143.2 98/15 │
+╰────────────┴─────────────╯
 Sustained Decode: aggregate tok/s uses OpenAI stream usage by default 
 (continuous completion_tokens when the server supports it). Prometheus is kept 
 as validation/scheduler data.
@@ -63,22 +63,22 @@ Per-Request tok/s
 ╭────────────┬───────╮
 │ ctx \ conc │     1 │
 ├────────────┼───────┤
-│ 0          │ 174.9 │
-│ 16k        │ 124.8 │
-│ 32k        │ 115.9 │
-│ 64k        │ 113.9 │
-│ 128k       │ 112.7 │
+│ 0          │ 150.9 │
+│ 16k        │ 155.1 │
+│ 32k        │ 136.6 │
+│ 64k        │ 151.3 │
+│ 128k       │ 143.2 │
 ╰────────────┴───────╯
 Client request latency: p50 
 / p90 ms                    
 ╭────────────┬─────────────╮
 │ ctx \ conc │           1 │
 ├────────────┼─────────────┤
-│ 0          │ 17.2k/17.2k │
-│ 16k        │ 19.9k/19.9k │
-│ 32k        │ 21.2k/21.2k │
-│ 64k        │ 21.5k/21.5k │
-│ 128k       │ 21.7k/21.7k │
+│ 0          │ 16.3k/16.8k │
+│ 16k        │ 16.7k/16.7k │
+│ 32k        │ 16.7k/16.7k │
+│ 64k        │ 17.0k/17.0k │
+│ 128k       │ 17.8k/17.8k │
 ╰────────────┴─────────────╯
 Aggregate cells show dim detail as TTFT ms / ITL ms for the same ctx/conc 
 coordinate. ITL is computed from observed generated tokens, including streams 
@@ -105,11 +105,11 @@ Aggregate decode tok/s
 ╭────────────┬───────╮
 │ ctx \ conc │     1 │
 ├────────────┼───────┤
-│ 0          │ 174.9 │
-│ 16k        │ 124.8 │
-│ 32k        │ 115.9 │
-│ 64k        │ 113.9 │
-│ 128k       │ 112.7 │
+│ 0          │ 150.9 │
+│ 16k        │ 155.1 │
+│ 32k        │ 136.6 │
+│ 64k        │ 151.3 │
+│ 128k       │ 143.2 │
 ╰────────────┴───────╯
 
 Results saved to /out/ctxsweep.json

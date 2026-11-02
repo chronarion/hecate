@@ -18,12 +18,16 @@ from .bc_attn import bc_attn_enable, _trace_build, _compile_kernel, _get_sm_coun
 # hecate: the dense-decode MLA kernels were AOT-compiled without the JIT's divisibility specialization (no ":16" on
 # their pointer arguments), so they lost vectorized loads (unfold 12.8 us in the model vs 5.3 us JIT-compiled). Their
 # pointer arguments are all 16-byte aligned allocation bases (bucketed scratch, cache tensors, block-table staging).
-_AL16_KERNELS = {"_mla_stage_kernel", "_mla_absorb_kernel", "_mla_kv_quant_scatter_kernel", "_mla_kv_update_kernel",
+_AL16_KERNELS = {"_mla_stage_kernel", "_mla_absorb_kernel", "_mla_absorb_rope_kernel", "_mla_kv_quant_scatter_kernel", "_mla_kv_update_kernel",
                  "_mla_decode_split_kernel", "_mla_decode_combine_kernel", "_mla_unfold_kernel"}
 # cache_seqlens is a view into the generator's pinned stage arena at byte offset rows * width * 4 (misaligned for
 # page widths not divisible by 4); upstream likewise hints block_table but not cache_seqlens
 _AL16_SKIP = {"cache_seqlens"}
 _compile_kernel_aot = _compile_kernel
+# hecate (EXL3_DSA_MULTIROW=1): single-sequence sparse (DSA) slots run the batched kernels too, which read their scan
+# widths and causal bounds from the device state array (filled from cache_seqlens) instead of host scalars patched per
+# call, so a whole decode step past index_topk can be captured and replayed as one CUDA graph (exl3_vgraph)
+_FORCE_MR = _os.environ.get("EXL3_DSA_MULTIROW", "0") == "1"
 
 
 def _compile_kernel(device, fn, signature, *a, **k):
@@ -169,6 +173,19 @@ class BCMLA:
         # hecate: tcgen05 sparse decode attention (EXL3_HMLA_DECODE=1; EXL3_HMLA_NS CTAs per query row), see hmla.cu
         if _os.environ.get("EXL3_HMLA_DECODE", "1") == "1" and self.quant and self.k_bits == 6:
             self.bc.set_hmla(float(self.sm_scale), int(_os.environ.get("EXL3_HMLA_NS", "16")))
+        if _FORCE_MR and hasattr(self.bc, "set_force_multirow"):
+            self.bc.set_force_multirow(True)
+        # hecate (EXL3_MLA_KVQ=1): fused decode cache append (kv_a norm + key rope + quantization + paged scatter, one
+        # kernel on a side branch of the graph forked after the q_a + kv_a projection); the absorb kernel then applies
+        # the query rope from the sin/cos table it writes (docker/patches/exllamav3/kvq)
+        # (EXL3_MLA_KVQ=3: full-indexer layers also run their indexer-key stages on that branch)
+        self.rope_style = rope_style
+        kvq_mode = int(_os.environ.get("EXL3_MLA_KVQ", "0") or 0)
+        self.kvq = bool(kvq_mode & 1 and hasattr(self.bc, "set_kvq") and self.quant and
+                        self.k_bits in (4, 5, 6, 8) and self.kv_lora_rank == 512 and self.qk_rope_head_dim == 64 and
+                        rope_style in (1, 2) and rotate_dims == 1 and not m.l4_beta)
+        if self.kvq:
+            self.bc.set_kvq(kvq_mode & 3)
 
         # DSA lightning indexer (GLM-5.2). Full layers project/norm/rope/append keys every
         # step and score + select in the sparse regime; shared layers gather through an
@@ -223,6 +240,7 @@ class BCMLA:
         from .mla_triton import (
             _mla_stage_kernel,
             _mla_absorb_kernel,
+            _mla_absorb_rope_kernel,
             _mla_kv_update_kernel,
             _mla_kv_quant_scatter_kernel,
             _mla_decode_split_kernel,
@@ -249,16 +267,28 @@ class BCMLA:
         absorb_bm = min(64, triton.next_power_of_2(max(R, 16)))
         absorb_bn = int(_os.environ.get("EXL3_ABSORB_BN", 0)) or 128   # hecate: D_c tile (grid dim 1 = D_c / BN)
         _absorb_sig, _absorb_range = mla_absorb_signature()
-        # pointer_range_32 is part of the compile contract -- see mla_absorb_signature()
-        k_absorb = _compile_kernel(dev, _mla_absorb_kernel,
-            _absorb_sig
-            | {n: "constexpr" for n in (
-                "n_q_heads", "QK_DIM", "Q_STRIDE", "D_nope", "NOPE_PAD", "D_c", "BLOCK_M", "BLOCK_N")},
-            dict(n_q_heads = H, QK_DIM = QK, Q_STRIDE = self.w_q, D_nope = D_nope,
-                 NOPE_PAD = triton.next_power_of_2(D_nope), D_c = D_c,
-                 BLOCK_M = absorb_bm, BLOCK_N = absorb_bn),
-            *_env_cfg("EXL3_ABSORB_CFG", (4, 2)),
-            pointer_range_32 = _absorb_range)
+        if self.kvq:
+            # hecate: the variant that also writes the rotated q_pe (the C++ graph passes q_pe and the sin/cos table)
+            k_absorb = _compile_kernel(dev, _mla_absorb_rope_kernel,
+                {"q": "*fp16", "w_uk_flat": "*fp16", "out": "*fp16", "R": "i32", "q_pe": "*fp16", "sincos": "*fp32"}
+                | {n: "constexpr" for n in (
+                    "n_q_heads", "QK_DIM", "Q_STRIDE", "D_nope", "NOPE_PAD", "D_c", "BLOCK_M", "BLOCK_N", "D_r",
+                    "ROPE_GPTJ")},
+                dict(n_q_heads = H, QK_DIM = QK, Q_STRIDE = self.w_q, D_nope = D_nope,
+                     NOPE_PAD = triton.next_power_of_2(D_nope), D_c = D_c,
+                     BLOCK_M = absorb_bm, BLOCK_N = absorb_bn, D_r = D_r, ROPE_GPTJ = int(self.rope_style == 1)),
+                *_env_cfg("EXL3_ABSORB_CFG", (4, 2)))
+        else:
+            # pointer_range_32 is part of the compile contract -- see mla_absorb_signature()
+            k_absorb = _compile_kernel(dev, _mla_absorb_kernel,
+                _absorb_sig
+                | {n: "constexpr" for n in (
+                    "n_q_heads", "QK_DIM", "Q_STRIDE", "D_nope", "NOPE_PAD", "D_c", "BLOCK_M", "BLOCK_N")},
+                dict(n_q_heads = H, QK_DIM = QK, Q_STRIDE = self.w_q, D_nope = D_nope,
+                     NOPE_PAD = triton.next_power_of_2(D_nope), D_c = D_c,
+                     BLOCK_M = absorb_bm, BLOCK_N = absorb_bn),
+                *_env_cfg("EXL3_ABSORB_CFG", (4, 2)),
+                pointer_range_32 = _absorb_range)
 
         if self.quant:
             groups = D_c // 32
@@ -478,7 +508,7 @@ class BCMLA:
                 scores.fill_(-float("inf"))
                 # Batched slots score in MULTIROW mode: T / q_pos0 / bound_max are per-job
                 # device pointers into the seq-state array, the block table one row per job
-                mr = 1 if bsz > 1 else 0
+                mr = 1 if (bsz > 1 or _FORCE_MR) else 0
                 bnd_t = "*i32:16" if mr else "i32"
                 sig = {
                     "q_idx": "*fp16:16", "w": "*fp16:16", "k_idx": "*fp16:16",
@@ -511,7 +541,7 @@ class BCMLA:
                     dict(P = P, SEL = sel, K_pad = kp, KP_pool = kp_pool,
                          TAIL = 1 if m.index_kpool_tail else 0, SEQ = q_len,
                          MULTIROW = 0, BLOCK = 256), 4, 1)
-            if bsz > 1:
+            if bsz > 1 or _FORCE_MR:
                 dsa_arr = g_tensor_cache.get(dev, (2, MAX_BSZ), torch.int32, "bcm_dsa_arr")
             # ws_acc rows are D_c wide: OUT_LATENT never accumulates the rope half
             ws_ml = sbuf("bcm_dsa_wsml", R * hb * N_SPLITS * BLOCK_H * 2, dtype = torch.float)
@@ -541,7 +571,7 @@ class BCMLA:
                 BLOCK_H = BLOCK_H, BLOCK_N = 32, BLOCK_W = 16,
                 # MULTIROW under Q_SPLIT only routes each job to its own block-table row;
                 # the per-job state args stay scalar (causality lives in the selection)
-                SEQ = q_len, MULTIROW = 1 if bsz > 1 else 0,
+                SEQ = q_len, MULTIROW = 1 if (bsz > 1 or _FORCE_MR) else 0,
                 DEBUG_BOUNDS = 0, DEBUG_PAGES = 0,
                 Q_SPLIT = 1, OUT_LATENT = 1,
                 QC = self.k_bits if self.quant else 0,

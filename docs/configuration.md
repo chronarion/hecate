@@ -39,11 +39,16 @@ experts run, not their weights.
 
 | Variable | Default | |
 |---|---|---|
-| `EXL3_VERIFY_GRAPH` / `EXL3_DRAFT_GRAPH` | 1 / 1 | decode-verify forward and MTP draft passes as CUDA graphs (contexts ≤ 2048 tokens) |
+| `EXL3_VERIFY_GRAPH` / `EXL3_DRAFT_GRAPH` | 1 / 1 | decode-verify forward and MTP draft passes as CUDA graphs |
+| `EXL3_DSA_MULTIROW` / `EXL3_VERIFY_GRAPH_SPARSE` | 1 / 1 | contexts above 2,048 tokens (the DSA regime): a single conversation's sparse attention reads its scan widths and causal bounds from device state instead of host scalars, so its decode steps replay as CUDA graphs too (keyed by regime); 0 / 0 = those steps run eagerly |
+| `EXL3_MLA_KVQ` | 3 | decode attention with the quantized latent cache: one kernel does the kv_a norm, the rope key, the Q6 group quantization and the paged cache write, on a side branch of the graph that runs while the q_a norm and q_b GEMV run (the absorb kernel applies the query rope); bit-identical cache contents. 3 (default) = also the indexer-key stages of the 21 full-indexer layers on that branch, 1 = the cache append only; 0 = the separate staging, rope, quant and scatter kernels |
 | `EXL3_PRELAUNCH` | 1 | pipelined decode step for a single conversation: the next MTP drafts + verify are launched as soon as a step's accepted tokens are known, before its bookkeeping (needs the two graphs above) |
-| `EXL3_ROUTER_FUSED` | 1 | router GEMV + sigmoid/bias top-8 as one kernel |
+| `EXL3_ROUTER_FUSED` | 1 | router GEMV + sigmoid/bias top-8 as one kernel (each top-k round is two warp reductions over order-preserving keys; the same selections as a sequential scan) |
 | `EXL3_DRAFT_HEAD_I4` | 1 | int4 copy of the LM head for MTP drafts (+0.48 GB) |
 | `EXL3_TIER_SH_FAST` | 1 | shared expert straight into the hot-tier accumulator |
+| `EXL3_TIER_HSIDE` | 1 | decode MoE layers: the handoff kernel (MoE input and routing copied into the RTX / Grace mailboxes, then the release flag) runs on a side stream, so the GB300's shared expert and hot experts start without waiting for it; joined before the combine. `EXL3_TIER_HANDOFF_THREADS` (256) sizes its single block |
+| `EXL3_TIER_COMBINE_NORM` | 1 | decode MoE layers whose output goes straight to the next block's input norm leave their combine (wait for the RTX / Grace bands, add the partials) to that norm: one kernel adds the partials, updates the residual and normalizes (runtime/tier/cn.cu); bit-identical |
+| `EXL3_NORM2` | 1 | RMSNorm rows of up to two float4 columns per thread (the 6144-wide norms) keep their values in registers between the reduction and the scaling, with every load issued first; bit-identical; 0 = the original paths |
 | `EXL3_EMBED_GPU` | 1 | token embedding in HBM (+1.9 GB; avoids a host sync per draft pass) |
 | `EXL3_RTX_STAGE` | 1 | copy each layer's mailbox into RTX VRAM before the RTX kernels |
 | `EXL3_RTX_MOE3` | 1 | run the RTX band on the moe3 trellis MoE kernels; 0 = ExLlamaV3's cooperative MoE kernels |
@@ -52,6 +57,7 @@ experts run, not their weights.
 | `EXL3_I8_UNPACK_FUSED` | 1 | prefill unpacks the int8 linears (attention, shared experts, LM head) with one fused kernel; 0 = torch ops (same values) |
 | `EXL3_I8_GEMV_ROWS` | 64 | int8 linears run the decode GEMV in 8-row chunks up to this many rows (decode batches at concurrency 16-32); more rows unpack the weights |
 | `EXL3_RTX_P3_NPOS` / `EXL3_TIER_P4_NPOS` | 16384 / 16384 | expert picks per moe3p / moe4p call (scratch ~45 KB per pick on the RTX / GB300) |
+| `EXL3_PREFILL_GB300_ROWS` | 2048 | prompt chunks above this many rows run every routed expert on the GB300's tensor cores: the int4 tiers on the tcgen05 grouped GEMM `moe4t` (gate and up in one CTA, SiLU epilogue), the RTX band's 3-bit trellis on `moe3t`, read in place over C2C from a pinned copy in Grace memory (~85 GB host RAM; +0.7 GB HBM scratch), on a second stream; the RTX idles. Shorter chunks keep the split path above; 0 = off |
 | `EXL3_HMLA_PREFILL` | 1 | sparse (DSA) attention of prompt chunks on the tcgen05 kernel (`docker/patches/exllamav3/hmla`); 0 = the Triton gather kernel |
 | `EXL3_HMLA_DECODE` / `EXL3_HMLA_NS` | 1 / 16 | sparse (DSA) attention of decode steps (contexts above 2,048 tokens) on the tcgen05 kernel, each query row's key list split across NS CTAs; 0 = the Triton split + combine. Shorter contexts keep the Triton kernels |
 | `EXL3_MLA_BLOCK_H_Q`, `EXL3_MLA_SPLIT_TILES`, `EXL3_MLA_COMBINE_DSPLIT`, `EXL3_COMBINE_CFG` | 4, 1, 16, 8,1 | MLA decode launch shapes |

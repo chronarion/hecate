@@ -29,6 +29,8 @@ import torch
 
 ON = os.environ.get("EXL3_VERIFY_GRAPH", "0") == "1"
 MAXCTX = int(os.environ.get("EXL3_VERIFY_GRAPH_MAXCTX", "0") or 0)   # dense-regime bound (0: the model's index_topk)
+# EXL3_VERIFY_GRAPH_SPARSE=1 (needs EXL3_DSA_MULTIROW=1): sparse (DSA) regime steps are captured too, keyed by regime
+SPARSE = os.environ.get("EXL3_VERIFY_GRAPH_SPARSE", "0") == "1"
 EVERY = int(os.environ.get("EXL3_VERIFY_GRAPH_EVERY", "2000"))
 # EXL3_VERIFY_GRAPH_CHECK=N: every Nth replay, rerun the step eagerly (it rewrites the same KV positions with the same
 # values) and compare its logits with the replay's (KL of the softmaxes, top-1 agreement); diagnostic, costs a forward
@@ -76,11 +78,12 @@ def draft_graph(gen, bsz, block_index, cache_seqlens, batch_ids, temp_hidden, ga
     sl = int(cache_seqlens[0])
     n_gap = int(gap["ids"].shape[-1]) if gap is not None else 0
     lim = _S.get("maxctx") or MAXCTX or int(getattr(gen.model.config, "index_topk", 0) or 0) or (1 << 30)
-    if sl + window + 1 > lim:
+    regime = int(sl + window + 1 > lim)
+    if regime and (not SPARSE or sl + 1 <= lim):     # (a step whose passes cross into the sparse regime stays eager)
         _D["n"]["draft_eager"] += 1
         return None
     W = int(block_index.shape[1])
-    key = (window, n_gap, W)
+    key = (window, n_gap, W, regime) if SPARSE else (window, n_gap, W)
     if defer and key not in _D["graphs"]:
         return None
     if key not in _D["warm"]:
@@ -195,11 +198,11 @@ def verify_prelaunch(model, last_tok, draft_dev, params):
     R = 1 + int(draft_dev.shape[-1])
     sl = sl_h.tolist()
     lim = _S.get("maxctx")
-    if lim is None or sl[0] + R > lim:
+    if lim is None or (sl[0] + R > lim and not SPARSE):
         return None
     dev = torch.device("cuda", torch.cuda.current_device())
     ptrs = _dev_ptrs(params, dev)
-    key = (R, bt_h.shape[1], ())
+    key = (R, bt_h.shape[1], (int(sl[0] + R > lim),) if SPARSE else ())
     ent = _S["graphs"].get(key)
     ids = _S["ids"].get(R)
     if ptrs is None or ent is None or ent["ptrs"] != ptrs or ids is None:
@@ -274,14 +277,15 @@ def _verify(model, fw0, input_ids, params):
     if lim is None:
         lim = _S["maxctx"] = MAXCTX or int(getattr(model.config, "index_topk", 0) or 0) or (1 << 30)
         print(f" -- vgraph: dense-regime bound {lim} tokens", flush=True)
-    if sl[0] + R > lim:
-        _eager("sparse")                  # DSA regime: eager (per-module graphs); kernel-bound, a whole graph gains ~nothing
+    regime = int(sl[0] + R > lim)
+    if regime and not SPARSE:
+        _eager("sparse")                  # DSA regime: eager (per-module graphs) unless EXL3_VERIFY_GRAPH_SPARSE
         return fw0(model, input_ids, params)
     dev = torch.device("cuda", torch.cuda.current_device())
     ptrs = _dev_ptrs(params, dev)
     if ptrs is None:
         _eager("arena"); return fw0(model, input_ids, params)
-    flags = ()
+    flags = (regime,) if SPARSE else ()
     key = (R, bt_h.shape[1], flags)
     ent = _S["graphs"].get(key)
     if ent is not None and ent["ptrs"] != ptrs:

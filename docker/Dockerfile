@@ -54,6 +54,14 @@ RUN python3 /tmp/p/fold/apply_fold.py ${EXT} /tmp/p/fold
 RUN python3 /tmp/p/vg_eager.py ${EXT}
 # 6. tcgen05 sparse attention for the MLA prefill and the long-context decode (EXL3_HMLA_PREFILL, EXL3_HMLA_DECODE)
 RUN python3 /tmp/p/hmla/apply_hmla.py ${EXT} ${SP} /tmp/p/hmla
+# 7. single-sequence sparse (DSA) decode on the batched kernels, so long-context steps replay as CUDA graphs
+RUN python3 /tmp/p/sparse/apply_dsa_multirow.py ${EXT}
+# 8. fused MLA decode cache append (norm + rope + Q6 quant + scatter) on a side branch of the graph (EXL3_MLA_KVQ)
+RUN python3 /tmp/p/kvq/apply_kvq.py ${EXT} /tmp/p/kvq
+# 9. RMSNorm rows of <= 2 x blockDim float4 columns in registers, loads first (EXL3_NORM2, bit-identical)
+RUN python3 /tmp/p/norm/apply_norm2.py ${EXT}
+# 10. the decode MoE combine fused into the next block's input norm (EXL3_TIER_COMBINE_NORM, runtime/tier/cn.cu)
+RUN python3 /tmp/p/cn/apply_cn.py ${SP}
 RUN cd /opt/exllamav3 && (MAX_JOBS=${MAX_JOBS} python setup.py build_ext > /tmp/build_ext.log 2>&1 \
       || (grep -B2 -A8 -E " error|Error" /tmp/build_ext.log | head -80; exit 1)) \
  && cp build/lib.linux-aarch64-cpython-312/exllamav3_ext.cpython-312-aarch64-linux-gnu.so /opt/venv/lib/python3.12/site-packages/ \
@@ -82,8 +90,9 @@ ENV EXL3_MOE4_SRC=/opt/hecate/tier/moe4 EXL3_TIER_BUILD=/root/.cache/hecate-tier
     EXL3_FP16_LINEARS='self_attn\.(q_a_proj|q_b_proj|kv_a_proj_with_mqa|o_proj|indexer\.wq_b)' \
     EXL3_SKIP_TRELLIS=1 \
     EXL3_RTX_CAP_ROWS=8192 EXL3_PREFILL_GROUP=24 EXL3_RTX_PREFILL_ROWS=64 EXL3_PREFILL_DECODE_SHARE=0.3 \
-    EXL3_RTX_PREFILL_MOE3P=1 EXL3_TIER_PREFILL_MOE4P=1 \
+    EXL3_RTX_PREFILL_MOE3P=1 EXL3_TIER_PREFILL_MOE4P=1 EXL3_PREFILL_GB300_ROWS=2048 \
     EXL3_GRAPHS=1 EXL3_VERIFY_GRAPH=1 EXL3_VERIFY_GRAPH_EVERY=2000 EXL3_DRAFT_GRAPH=1 EXL3_ROUTER_FUSED=1 \
+    EXL3_DSA_MULTIROW=1 EXL3_VERIFY_GRAPH_SPARSE=1 EXL3_MLA_KVQ=3 EXL3_TIER_HSIDE=1 EXL3_NORM2=1 EXL3_TIER_COMBINE_NORM=1 \
     EXL3_DSA_TOPK_SPLIT=0 EXL3_MLA_SPLIT_TPS=2 EXL3_MLA_SPLIT_TILES=1 EXL3_MLA_COMBINE_DSPLIT=16 EXL3_COMBINE_CFG=8,1 \
     EXL3_MLA_BLOCK_H_Q=4 EXL3_WARMUP=1
 RUN find ${SP} -name __pycache__ -prune -exec rm -rf {} +

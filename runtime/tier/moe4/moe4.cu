@@ -632,7 +632,10 @@ void moe4_handoff(torch::Tensor y, torch::Tensor sel, torch::Tensor rw, int64_t 
     const at::cuda::OptionalCUDAGuard guard(y.device());
     TORCH_CHECK(y.is_contiguous() && sel.is_contiguous() && rw.is_contiguous(), "moe4_handoff: contiguous");
     const int ny = (int) (rows * y.size(-1) * 2 / 16), ns = (int) (rows * sel.size(-1) * 8 / 16), nw = (int) (rows * rw.size(-1) * 2 / 4);
-    moe4_handoff_kernel<<<1, 1024, 0, at::cuda::getCurrentCUDAStream().stream()>>>((const uint4*) y.data_ptr(),
+    // one 256-thread block (EXL3_TIER_HANDOFF_THREADS): small enough to co-schedule with the shared-expert GEMV's CTAs
+    // when it runs on the side stream (EXL3_TIER_HSIDE; a 1024-thread block may wait for an SM to drain)
+    static const int ht = [] { const char* e = getenv("EXL3_TIER_HANDOFF_THREADS"); return e ? atoi(e) : 256; }();
+    moe4_handoff_kernel<<<1, ht, 0, at::cuda::getCurrentCUDAStream().stream()>>>((const uint4*) y.data_ptr(),
         (const uint4*) sel.data_ptr(), (const uint32_t*) rw.data_ptr(), (uint4*) dy, (uint4*) ds, (uint32_t*) dw,
         (unsigned*) flag, (unsigned) gen, ny, ns, nw, (unsigned*) meta, (unsigned) m0, (unsigned) rows, (unsigned*) flag2, (unsigned) gen2, (unsigned*) zero);
 }

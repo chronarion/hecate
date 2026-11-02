@@ -4,7 +4,7 @@
     "engine": "openai_proxy",
     "model": "base",
     "server": "127.0.0.1:8103",
-    "timestamp": "2026-11-01T19:10:33.888237",
+    "timestamp": "2026-11-02T21:42:16.277849",
     "decode_mode": "duration",
     "primary_decode_layer": "sustained_decode",
     "duration_per_test": 30.0,
@@ -71,8 +71,8 @@
   "startup_diagnostics": {
     "version": "0.8.0",
     "server_url": "http://127.0.0.1:8103",
-    "hostname": "dgx-station",
-    "uname": "Linux dgx-station 7.0.0-1019-nvidia-64k #19~24.04.2-Ubuntu SMP PREEMPT_DYNAMIC Sun Sep  6 20:24:04 UTC 2 aarch64 GNU/Linux",
+    "hostname": "moiraine",
+    "uname": "Linux moiraine 7.0.0-1019-nvidia-64k #19~24.04.2-Ubuntu SMP PREEMPT_DYNAMIC Sun Sep  6 20:24:04 UTC 2 aarch64 GNU/Linux",
     "env": {},
     "args": {
       "concurrency": "1,2,4,8,16,32,64,128",
@@ -185,12 +185,12 @@
   "event_log": [],
   "prefill": {
     "65536": {
-      "ttft_seconds": 18.469,
-      "prefill_seconds": 18.469,
-      "tok_per_sec": 3493.0,
-      "client_ttft_seconds": 18.469,
-      "client_tok_per_sec": 3493.0,
-      "prompt_tokens": 64514,
+      "ttft_seconds": 14.399,
+      "prefill_seconds": 14.399,
+      "tok_per_sec": 4479.0,
+      "client_ttft_seconds": 14.399,
+      "client_tok_per_sec": 4479.0,
+      "prompt_tokens": 64494,
       "samples": 1,
       "method": "client",
       "server_validation": {

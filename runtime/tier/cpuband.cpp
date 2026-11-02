@@ -38,7 +38,9 @@ struct Pool
     std::vector<std::thread> th;
     std::atomic<bool> stop{false};
     // per job (written by thread 0 between barriers)
-    std::atomic<uint32_t> bar_count{0}, bar_sense{0};
+    // hecate: counter and sense on separate cache lines (adjacent, every fetch_add fought the spinners for the line)
+    alignas(128) std::atomic<uint32_t> bar_count{0};
+    alignas(128) std::atomic<uint32_t> bar_sense{0};
     int R = 0, P = 0, L = -1; int pick[MAXP]; float wgt[MAXP][MAXR]; int nr[MAXP]; int rows[MAXP][MAXR];
     alignas(64) int8_t xqp[MAXP][MAXR * H]; float xgp[MAXP][MAXR * H / 32];   // x rows of each pick's rows, compacted
     alignas(64) int8_t xq[MAXR * H]; float xg[MAXR * H / 32];

@@ -138,12 +138,37 @@ def rtx_split_load(self, device, **kwargs):
             tabs += [torch.tensor(x, dtype=torch.int64, device=rdev) for x in (tr, su, sv)]
     kg, ku, kd = Ks[0], Ks[len(tail[0])], Ks[2 * len(tail[0])]
     self._rtx = types.SimpleNamespace(first=first, E=len(perm), tabs=tabs, keep=keep, K=(float(kg), float(ku), float(kd)), H=H)
+    if GB_ROWS > 0 and all(round(k) == 3 for k in self._rtx.K):
+        _host_band(self, device)
     self.cpu_split_submit = types.MethodType(rtx_submit, self)
     self.cpu_split_combine = types.MethodType(rtx_combine, self)
     self.cpu_unload = types.MethodType(lambda s: None, self)
     print(f" -- RTX split: {self.key} [{first}..{len(perm)}) of {len(perm)} on cuda:{RDEV} (K {kg:.0f}/{ku:.0f}/{kd:.0f})", flush=True)
 
 
+def _host_band(self, gdev):
+    """copy of the layer's RTX band (trellis, suh, svh of every expert) in pinned Grace memory, for the GB300's long-prefill
+    path (tier_split._prefill_gb300 reads it in place over C2C); self._rtx.htabs = the 9 pointer tables on the GB300"""
+    R = self._rtx
+    sizes = [t.numel() * t.element_size() for t in R.keep]
+    offs, o = [], 0
+    for n in sizes: offs.append(o); o += (n + 255) // 256 * 256
+    with torch.cuda.device(gdev):
+        hbuf = int(_ck(cu.cuMemHostAlloc(o, cu.CU_MEMHOSTALLOC_PORTABLE | cu.CU_MEMHOSTALLOC_DEVICEMAP)))
+        dbase = int(_ck(cu.cuMemHostGetDevicePointer(hbuf, 0)))
+    with torch.cuda.device(_S.r):
+        for t, o0, n in zip(R.keep, offs, sizes):
+            _ck(cu.cuMemcpyDtoH(hbuf + o0, t.data_ptr(), n))
+    nt = len(R.keep) // 9
+    ptr = [dbase + o0 for o0 in offs]                         # keep = [t, su, sv] per expert, gate block / up / down
+    R.htabs = [torch.tensor([ptr[3 * (m * nt + j) + k] for j in range(nt)], dtype=torch.int64, device=gdev)
+               for m in range(3) for k in range(3)]
+    R.hbuf, R.hbytes = hbuf, o
+    _S.hband = getattr(_S, "hband", 0) + o
+
+
+GB_ROWS = int(os.environ.get("EXL3_PREFILL_GB300_ROWS", "0"))   # > 0: prefill chunks above this many rows run every
+#                                                                 expert on the GB300 (tier_split._prefill_gb300)
 PF_ROWS = int(os.environ.get("EXL3_RTX_PREFILL_ROWS", "64"))
 _PF_CHECK = [int(os.environ.get("EXL3_RTX_PREFILL_CHECK", "0"))]   # above this many rows: per-expert dequant + GEMM prefill
 
@@ -208,18 +233,24 @@ def _rtx_prefill3(self, X, SEL, RW, OUT, bsz, counts):
                     *R.tabs, *scr, out)
 
 
-def pick_groups(counts, npos, bm=64):
-    """Work lists of the moe3p / moe4p prefill kernels. counts: picks per expert (picks sorted by expert, no expert above
-    npos). Yields expert groups of <= npos picks as (first pick, end pick, row blocks), row blocks = int32 [n, 4]
-    {expert, first pick relative to the group, picks (<= bm), 0}."""
+def pick_groups(counts, npos, bm=64, balance=False):
+    """Work lists of the moe3p / moe4p (and moe3t / moe4t) prefill kernels. counts: picks per expert (picks sorted by expert,
+    no expert above npos). Yields expert groups of <= npos picks as (first pick, end pick, row blocks), row blocks = int32
+    [n, 4] {expert, first pick relative to the group, picks (<= bm), 0}. balance: an expert's blocks get near-equal sizes
+    (300 picks at bm 256: 150 + 150 instead of 256 + 44)."""
     c = np.asarray(counts, dtype=np.int64); ends = np.cumsum(c); e0 = 0
     while e0 < len(c):
         p0 = int(ends[e0] - c[e0])
         e1 = int(np.searchsorted(ends, p0 + npos, side="right"))
         cg = c[e0:e1]; nrb = (cg + bm - 1) // bm
         k = np.arange(int(nrb.sum())) - np.repeat(np.cumsum(nrb) - nrb, nrb)         # row block index within its expert
-        rows = np.minimum(bm, np.repeat(cg, nrb) - bm * k)
-        rel = np.repeat(ends[e0:e1] - cg - p0, nrb) + bm * k
+        if balance:
+            nr = np.maximum(np.repeat(nrb, nrb), 1); cc = np.repeat(cg, nrb)
+            base, extra = cc // nr, cc % nr
+            rows = base + (k < extra); start = k * base + np.minimum(k, extra)
+        else:
+            rows = np.minimum(bm, np.repeat(cg, nrb) - bm * k); start = bm * k
+        rel = np.repeat(ends[e0:e1] - cg - p0, nrb) + start
         yield p0, int(ends[e1 - 1]), np.stack([np.repeat(np.arange(e0, e1), nrb), rel, rows, 0 * rows], 1).astype(np.int32)
         e0 = e1
 

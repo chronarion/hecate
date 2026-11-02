@@ -174,6 +174,7 @@ __global__ void __launch_bounds__(NT, 1) hmla_kernel(const half* __restrict__ q_
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1200   // tcgen05: sm_100 family only (the RTX build gets an empty body)
     extern __shared__ __align__(1024) unsigned char smem[];
     const int r = blockIdx.y, split = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");   // hecate (R): see hmla_combine_t (no-op without PDL)
     unsigned char* Kt[2] = {smem + SM_K0, smem + SM_K1};
     unsigned char* Ps = smem + SM_P;
     float* XB = (float*) (smem + SM_XB); float* XS = (float*) (smem + SM_XS); int* RING = (int*) (smem + SM_RING);
@@ -194,7 +195,7 @@ __global__ void __launch_bounds__(NT, 1) hmla_kernel(const half* __restrict__ q_
 
     if (tid == 0)
     {
-        bar_init(bq, NL); bar_init(bqcp, 1); bar_init(bk0, 128); bar_init(bk0 + 8, 128); bar_init(bs, 1); bar_init(bsf, 128);
+        bar_init(bq, NL + 128); bar_init(bqcp, 1); bar_init(bk0, NL); bar_init(bk0 + 8, NL); bar_init(bs, 1); bar_init(bsf, 128);
         bar_init(bp, 128); bar_init(bo0, 1); bar_init(bo0 + 8, 1);
     }
     if (warp == 12)
@@ -208,15 +209,16 @@ __global__ void __launch_bounds__(NT, 1) hmla_kernel(const half* __restrict__ q_
     __syncthreads();
     tc_fence_after();
     const uint32_t tmem = *tm_base;
-
-    if (warp >= 4 && warp < 12)
+    // hecate (R): Q is staged by the load WG and the softmax WG together (3 items per thread, the softmax WG idles until S(0)
+    // anyway); each load-WG half issues its first tile's gathers before staging so their latency overlaps it; the split
+    // epilogue runs on all 12 non-MMA warps (TMEM lane quadrant = warp % 4, 32-column rounds dealt round-robin)
+    auto q_stage = [&](int qt)
     {
-        // ------------------------------------------------------------------------------------------- load WG (256 thr)
-        const int lt = tid - 128;
-        // Q into K tile 1 in the dual-half layout: (head, 32-dim block) items
-        for (int it = lt; it < H * 18; it += NL)
+        // Q into K tile 1 in the dual-half layout: (head, 32-dim block) items, item it = (block it / 64, head it % 64), so a
+        // warp's stores go to 32 consecutive tile rows (the swizzle's conflict-free pattern)
+        for (int it = qt; it < H * 18; it += NL + 128)
         {
-            const int h = it / 18, b = it % 18;
+            const int h = it % 64, b = it / 64;
             uint4 v[4];
             if (b < 16)
             {
@@ -256,54 +258,116 @@ __global__ void __launch_bounds__(NT, 1) hmla_kernel(const half* __restrict__ q_
         }
         fence_async_smem();
         bar_arrive(bq);
-        const int hh = lt >> 7, ht = lt & 127;            // half h fills K tile h for tiles h, h + 2, ...
-        for (int t = hh; t < ntiles; t += 2)
+    };
+    // split epilogue (ns > 1, after the last PV): rounds k0, k0 + 3, ... of this warp's quadrant as fp32 partials (O * f),
+    // staged per warp (4 KB in the free K tile 0, chunk i at slot i ^ (lane & 7)) so each store instruction writes four whole
+    // 128 B row segments
+    auto epi_split = [&](int k0, float f)
+    {
+        const int qd = warp & 3, rowb = (qd & 1) * 32, prt = qd >> 1;
+        const uint32_t ln = (uint32_t) (qd * 32) << 16;
+        float* stg = (float*) (smem + SM_K0) + warp * 1024;
+        float* dstb = part_o + (((size_t) split * R + r) * H + rowb) * DC;
+        #pragma unroll 1
+        for (int k = k0; k < 8; k += 3)
         {
-            const int buf = hh;
-            const int* sl = RING + (t & 7) * 64;
-            uint32_t wd[8][6]; float scv[8]; uint4 rp[4];
-            if (!(dbg & 1))                                // gathers first: their latency overlaps the buffer wait
+            const int c = k * 32;
+            uint32_t o[32];
+            if (ntiles > 0) { TLD32(o, tmem + ln + TM_O + c); tld_wait(); }
+            float4* tw = (float4*) (stg + lane * 32);
+            #pragma unroll
+            for (int i = 0; i < 8; ++i)
             {
+                float x[4];
                 #pragma unroll
-                for (int u = 0; u < 8; ++u)
-                {
-                    const int c = ht + u * 128, ti = c >> 4, gi = c & 15;
-                    const int sv = sl[ti], s0 = sv < 0 ? 0 : sv;
-                    const int2* src = (const int2*) (ckv + (size_t) s0 * 96 + gi * 6);
-                    const int2 a = __ldg(src), b2 = __ldg(src + 1), c2 = __ldg(src + 2);
-                    wd[u][0] = a.x; wd[u][1] = a.y; wd[u][2] = b2.x; wd[u][3] = b2.y; wd[u][4] = c2.x; wd[u][5] = c2.y;
-                    scv[u] = sv < 0 ? 0.f : __half2float(__ldg(ckv_s + (size_t) s0 * 16 + gi));
-                }
-                #pragma unroll
-                for (int u = 0; u < 4; ++u)
-                {
-                    const int c = ht + u * 128, ti = c >> 3, q = c & 7, sv = sl[ti];
-                    rp[u] = sv < 0 ? make_uint4(0, 0, 0, 0) : __ldg((const uint4*) (kpe + (size_t) sv * DR + q * 8));
-                }
+                for (int j = 0; j < 4; ++j) x[j] = ntiles > 0 ? __uint_as_float(o[4 * i + j]) * f : 0.f;
+                tw[i ^ (lane & 7)] = make_float4(x[0], x[1], x[2], x[3]);
             }
+            __syncwarp();
+            const int d0 = (c >> 7) * 256 + prt * 128 + (c & 127), q = lane & 7;
+            #pragma unroll
+            for (int kk = 0; kk < 8; ++kk)
+            {
+                const int seg = kk * 4 + (lane >> 3);
+                ((float4*) (dstb + (size_t) seg * DC + d0))[q] = ((const float4*) (stg + seg * 32))[q ^ (seg & 7)];
+            }
+            __syncwarp();
+        }
+    };
+
+    if (warp >= 4 && warp < 12)
+    {
+        // ------------------------------------------------------------------------------------------- load WG (256 thr)
+        const int lt = tid - 128;
+        // hecate (R3): all 256 load threads build every tile (a tile's dequant used to be one half's job, on the critical path
+        // between PV(t-2) and QK(t)); two register sets hold the gathered words of tiles t and t + 1 (prefetch distance 2)
+        uint32_t wdA[4][6], wdB[4][6]; float scA[4], scB[4]; uint4 rpA[2], rpB[2];
+        auto gather = [&](int t, uint32_t (&wd)[4][6], float (&scv)[4], uint4 (&rp)[2])   // tile t's words into registers
+        {
+            if (dbg & 1) return;
+            const int* sl = RING + (t & 7) * 64;
+            #pragma unroll
+            for (int u = 0; u < 4; ++u)
+            {
+                const int c = lt + u * NL, ti = c >> 4, gi = c & 15;
+                const int sv = sl[ti], s0 = sv < 0 ? 0 : sv;
+                const int2* src = (const int2*) (ckv + (size_t) s0 * 96 + gi * 6);
+                const int2 a = __ldg(src), b2 = __ldg(src + 1), c2 = __ldg(src + 2);
+                wd[u][0] = a.x; wd[u][1] = a.y; wd[u][2] = b2.x; wd[u][3] = b2.y; wd[u][4] = c2.x; wd[u][5] = c2.y;
+                scv[u] = sv < 0 ? 0.f : __half2float(__ldg(ckv_s + (size_t) s0 * 16 + gi));
+            }
+            #pragma unroll
+            for (int u = 0; u < 2; ++u)
+            {
+                const int c = lt + u * NL, ti = c >> 3, q = c & 7, sv = sl[ti];
+                rp[u] = sv < 0 ? make_uint4(0, 0, 0, 0) : __ldg((const uint4*) (kpe + (size_t) sv * DR + q * 8));
+            }
+        };
+        auto put = [&](int t, uint32_t (&wd)[4][6], float (&scv)[4], uint4 (&rp)[2])      // dequantize tile t into buffer t % 2
+        {
+            const int buf = t & 1;
             if (t >= 2) bar_wait(bo0 + 8 * buf, ((t - 2) >> 1) & 1);      // PV(t-2) done: tile buffer and ring slot free
             if (t == 1) bar_wait(bqcp, 0);                                 // Q copied out of tile buffer 1
-            if (ht < 64 && t + 4 < ntiles) RING[((t + 4) & 7) * 64 + ht] = slot_of(j0 + (t + 4) * TT + ht);
+            if (lt < 64 && t + 4 < ntiles) RING[((t + 4) & 7) * 64 + lt] = slot_of(j0 + (t + 4) * TT + lt);
             if (!(dbg & 1))
             {
                 #pragma unroll
-                for (int u = 0; u < 8; ++u)
+                for (int u = 0; u < 4; ++u)
                 {
-                    const int c = ht + u * 128, ti = c >> 4, gi = c & 15;
+                    const int c = lt + u * NL, ti = c >> 4, gi = c & 15;
                     uint4 o[4];
                     deq_group_fast(wd[u], scv[u], o);
                     #pragma unroll
                     for (int q = 0; q < 4; ++q) *(uint4*) (Kt[buf] + lat_off(ti, gi * 32 + q * 8)) = o[q];
                 }
                 #pragma unroll
-                for (int u = 0; u < 4; ++u)
+                for (int u = 0; u < 2; ++u)
                 {
-                    const int c = ht + u * 128, ti = c >> 3, q = c & 7;
+                    const int c = lt + u * NL, ti = c >> 3, q = c & 7;
                     *(uint4*) (Kt[buf] + rope_off(ti, q * 8)) = rp[u];
                 }
             }
             fence_async_smem();
             bar_arrive(bk0 + 8 * buf);
+        };
+        if (0 < ntiles) gather(0, wdA, scA, rpA);         // hecate (R): in flight while Q is staged
+        if (1 < ntiles) gather(1, wdB, scB, rpB);
+        q_stage(lt);
+        for (int t = 0; t < ntiles; t += 2)
+        {
+            put(t, wdA, scA, rpA);
+            if (t + 2 < ntiles) gather(t + 2, wdA, scA, rpA);
+            if (t + 1 < ntiles)
+            {
+                put(t + 1, wdB, scB, rpB);
+                if (t + 3 < ntiles) gather(t + 3, wdB, scB, rpB);
+            }
+        }
+        if (ns > 1)
+        {
+            if (ntiles > 0) { bar_wait(bo0 + 8 * ((ntiles - 1) & 1), ((ntiles - 1) >> 1) & 1); tc_fence_after(); }
+            epi_split(warp < 8 ? 1 : 2, 1.f);
+            tc_fence_before();
         }
     }
     else if (warp == 12)
@@ -364,6 +428,7 @@ __global__ void __launch_bounds__(NT, 1) hmla_kernel(const half* __restrict__ q_
     else
     {
         // ------------------------------------------------------------------------------------------- softmax WG (warps 0-3)
+        q_stage(NL + tid);                                 // hecate (R): its share of the Q stage
         const int row = (warp & 1) * 32 + lane, part = warp >> 1;      // TMEM lane 32w + lane = row + 64 * part
         const uint32_t lanes = (uint32_t) (warp * 32) << 16;
         float m = -1e30f, l = 0.f;
@@ -443,30 +508,26 @@ __global__ void __launch_bounds__(NT, 1) hmla_kernel(const half* __restrict__ q_
         const float lt_ = l + XS[(part ^ 1) * 64 + row];
         if (ntiles > 0) { bar_wait(bo0 + 8 * ((ntiles - 1) & 1), ((ntiles - 1) >> 1) & 1); tc_fence_after(); }
         const float f = (ns == 1) ? (lt_ > 0.f ? 1.f / lt_ : 0.f) : 1.f;
-        #pragma unroll 1
-        for (int c = 0; c < 256; c += 32)
+        if (ns == 1)
         {
-            uint32_t o[32];
-            float x[32];
-            if (ntiles > 0) { TLD32(o, tmem + lanes + TM_O + c); tld_wait(); }
-            #pragma unroll
-            for (int j = 0; j < 32; ++j) x[j] = ntiles > 0 ? __uint_as_float(o[j]) * f : 0.f;
-            const int d0 = (c >> 7) * 256 + part * 128 + (c & 127);
-            if (ns == 1)
+            #pragma unroll 1
+            for (int c = 0; c < 256; c += 32)
             {
+                uint32_t o[32];
+                float x[32];
+                if (ntiles > 0) { TLD32(o, tmem + lanes + TM_O + c); tld_wait(); }
+                #pragma unroll
+                for (int j = 0; j < 32; ++j) x[j] = ntiles > 0 ? __uint_as_float(o[j]) * f : 0.f;
+                const int d0 = (c >> 7) * 256 + part * 128 + (c & 127);
                 wht32r(x);
                 uint4* dst = (uint4*) (out + ((size_t) row * R + r) * DC + d0);
                 #pragma unroll
                 for (int i = 0; i < 4; ++i)
                     dst[i] = make_uint4(pack_h2(x[i * 8], x[i * 8 + 1]), pack_h2(x[i * 8 + 2], x[i * 8 + 3]), pack_h2(x[i * 8 + 4], x[i * 8 + 5]), pack_h2(x[i * 8 + 6], x[i * 8 + 7]));
             }
-            else
-            {
-                float4* dst = (float4*) (part_o + (((size_t) split * R + r) * H + row) * DC + d0);
-                #pragma unroll
-                for (int i = 0; i < 8; ++i) dst[i] = make_float4(x[4 * i], x[4 * i + 1], x[4 * i + 2], x[4 * i + 3]);
-            }
         }
+        else
+            epi_split(0, f);
         if (ns > 1 && part == 0)
         {
             float* pm = part_ml + (((size_t) split * R + r) * H + row) * 2;
@@ -495,6 +556,40 @@ __global__ void hmla_combine(const float* __restrict__ part_o, const float* __re
         const float wgt = exp2f(pm[0] - M);
         L += wgt * pm[1];
         acc += wgt * part_o[(((size_t) s * R + r) * H + h) * DC + w * 32 + lane];
+    }
+    float v = L > 0.f ? acc / L : 0.f;
+    #pragma unroll
+    for (int b = 1; b < 32; b <<= 1) { const float p = __shfl_xor_sync(0xffffffffu, v, b); v = (lane & b) ? p - v : v + p; }
+    out[((size_t) h * R + r) * DC + w * 32 + lane] = __float2half(v * 0.17677669529663687f);
+}
+
+// hecate (R): split count as a template parameter, every (m, l) and partial load issued up front; the same arithmetic in
+// the same order as hmla_combine (bit-identical). Launched with programmatic stream serialization: its CTAs start
+// on the SMs the attention grid leaves idle and wait here for that grid's completion and memory flush.
+template <int NS>
+__global__ void __launch_bounds__(512) hmla_combine_t(const float* __restrict__ part_o, const float* __restrict__ part_ml,
+                                                      half* __restrict__ out, int R)
+{
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    const int r = blockIdx.x / H, h = blockIdx.x % H, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    float mv[NS], lv[NS], ov[NS];
+    #pragma unroll
+    for (int s = 0; s < NS; ++s)
+    {
+        const float* pm = part_ml + (((size_t) s * R + r) * H + h) * 2;
+        mv[s] = pm[0]; lv[s] = pm[1];
+        ov[s] = part_o[(((size_t) s * R + r) * H + h) * DC + w * 32 + lane];
+    }
+    float M = -1e30f;
+    #pragma unroll
+    for (int s = 0; s < NS; ++s) M = fmaxf(M, mv[s]);
+    float L = 0.f, acc = 0.f;
+    #pragma unroll
+    for (int s = 0; s < NS; ++s)
+    {
+        const float wgt = exp2f(mv[s] - M);
+        L += wgt * lv[s];
+        acc += wgt * ov[s];
     }
     float v = L > 0.f ? acc / L : 0.f;
     #pragma unroll
@@ -537,7 +632,18 @@ static void hmla_launch(const at::Tensor& q_lat, const at::Tensor& q_pe, const a
         graph->record_param((void*) hmla_kernel, GP_dsa_indices, 6);
         graph->record_param((void*) hmla_kernel, GP_end, 0);
     }
-    if (ns > 1)
+    if (ns == 16 || ns == 8)
+    {
+        cudaLaunchAttribute at[1];
+        at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        at[0].val.programmaticStreamSerializationAllowed = 1;
+        cudaLaunchConfig_t cfg = {};
+        cfg.gridDim = dim3((unsigned) (R * H)); cfg.blockDim = dim3(512); cfg.dynamicSmemBytes = 0; cfg.stream = stream;
+        cfg.attrs = at; cfg.numAttrs = 1;
+        if (ns == 16) cudaLaunchKernelEx(&cfg, hmla_combine_t<16>, (const float*) po, (const float*) pml, (half*) out.data_ptr(), R);
+        else cudaLaunchKernelEx(&cfg, hmla_combine_t<8>, (const float*) po, (const float*) pml, (half*) out.data_ptr(), R);
+    }
+    else if (ns > 1)
         hmla_combine<<<R * H, 512, 0, stream>>>(po, pml, (half*) out.data_ptr(), ns, R);
 }
 
@@ -557,3 +663,5 @@ void hmla_attn(at::Tensor q_lat, at::Tensor q_pe, at::Tensor ckv, at::Tensor ckv
     hmla_launch(q_lat, q_pe, ckv, ckv_s, kpe, block_table, (const int*) indices.data_ptr(), (int) indices.size(1), (float) scale, out,
                 (int) ns, at::cuda::getCurrentCUDAStream().stream(), nullptr);
 }
+
+#include <torch/extension.h>

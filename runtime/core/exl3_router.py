@@ -3,7 +3,10 @@ GEMM + split-K reduce + the top-k kernel. 32 blocks of 8 warps: each block stage
 warp computes one expert's logits for every row (fp16 weights from the transposed gate, fp32 accumulation); the last
 block to finish (counter, self-resetting) picks per row the top-k of sigmoid(logit) + bias and writes the selected ids
 and the normalized, scaled weights into the module's usual routing buffers. Selection keys in fp32 (the stock path
-rounds logits and the mean-centered bias to fp16), so near-ties may resolve differently (KLD-neutral or better)."""
+rounds logits and the mean-centered bias to fp16), so near-ties may resolve differently (KLD-neutral or better).
+hecate (router v4): each top-k round is two redux.sync (max of order-preserving uint keys, then the lowest index among
+the lanes holding it: the same key desc / index asc order) and only the lane that gave up its best rescans its keys;
+the counter is one acq_rel atomic by thread 0 between block barriers instead of two per-thread fences."""
 import os
 import torch
 
@@ -68,17 +71,20 @@ __global__ void __launch_bounds__(WPB * 32) router_k(const half* __restrict__ x,
             if (lane == 0) atomicAdd(logits + r * MAXE + e, a);
         }
     }
-    __threadfence();
     __syncthreads();
     __shared__ int last;
-    if (threadIdx.x == 0) last = atomicAdd(ctr, 1) == (int) gridDim.x - 1;
+    if (threadIdx.x == 0)
+    {
+        int old_;
+        asm volatile("atom.add.acq_rel.gpu.s32 %0, [%1], 1;" : "=r"(old_) : "l"(ctr) : "memory");
+        last = old_ == (int) gridDim.x - 1;
+    }
     __syncthreads();
     if (!last) return;
-    __threadfence();
     if (wid < R)
     {
         const int r = wid;
-        float key[MAXE / 32], act[MAXE / 32];
+        unsigned key[MAXE / 32]; float act[MAXE / 32];
         #pragma unroll
         for (int i = 0; i < MAXE / 32; ++i)
         {
@@ -88,29 +94,30 @@ __global__ void __launch_bounds__(WPB * 32) router_k(const half* __restrict__ x,
                 const float l = __ldcg(logits + r * MAXE + ee);
                 logits[r * MAXE + ee] = 0.f;
                 act[i] = 1.f / (1.f + __expf(-l));
-                key[i] = act[i] + (bias ? bias[ee] : 0.f);
+                const unsigned u = __float_as_uint(act[i] + (bias ? bias[ee] : 0.f));
+                key[i] = (u & 0x80000000u) ? ~u : (u | 0x80000000u);    // order-preserving
             }
-            else { act[i] = 0.f; key[i] = -1e30f; }
+            else { act[i] = 0.f; key[i] = 0u; }
         }
+        unsigned lk = 0u; int li = 0;
+        #pragma unroll
+        for (int i = 0; i < MAXE / 32; ++i) if (key[i] > lk) { lk = key[i]; li = i; }
         float wsel[TOPK_MAX]; int isel[TOPK_MAX]; float sum = 0.f;
         for (int k = 0; k < topk; ++k)
         {
-            float bk = -1e30f; int bi = 0x7fffffff;
-            #pragma unroll
-            for (int i = 0; i < MAXE / 32; ++i)
-                if (key[i] > bk || (key[i] == bk && lane + 32 * i < bi)) { bk = key[i]; bi = lane + 32 * i; }
-            #pragma unroll
-            for (int o = 16; o; o >>= 1)
-            {
-                const float ok = __shfl_xor_sync(0xffffffffu, bk, o); const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
-                if (ok > bk || (ok == bk && oi < bi)) { bk = ok; bi = oi; }
-            }
+            const unsigned m = __reduce_max_sync(0xffffffffu, lk);
+            const unsigned bi = __reduce_min_sync(0xffffffffu, lk == m ? (unsigned) (lane + 32 * li) : 0xffffffffu);
             float a = 0.f;
-            if ((bi & 31) == lane) { const int i = bi >> 5;
+            if ((int) (bi & 31) == lane)
+            {
                 #pragma unroll
-                for (int j = 0; j < MAXE / 32; ++j) if (j == i) { a = act[j]; key[j] = -1e30f; } }
+                for (int j = 0; j < MAXE / 32; ++j) if (j == li) { a = act[j]; key[j] = 0u; }
+                lk = 0u; li = 0;
+                #pragma unroll
+                for (int i = 0; i < MAXE / 32; ++i) if (key[i] > lk) { lk = key[i]; li = i; }
+            }
             a = __shfl_sync(0xffffffffu, a, bi & 31);
-            wsel[k] = a; isel[k] = bi; sum += a;
+            wsel[k] = a; isel[k] = (int) bi; sum += a;
         }
         if (lane < topk)
         {
@@ -148,7 +155,7 @@ def _ext_mod():
     if _ext is None:
         from torch.utils.cpp_extension import load_inline
         bd = os.path.join(os.environ.get("EXL3_TIER_BUILD", "/tmp"), "build_router_fused"); os.makedirs(bd, exist_ok=True)
-        _ext = load_inline(name="exl3_router_fused3", cpp_sources="void router_fused(at::Tensor x, at::Tensor wt, c10::optional<at::Tensor> bias, at::Tensor logits, at::Tensor ctr, at::Tensor sel, at::Tensor rw, int64_t topk, double scale);",
+        _ext = load_inline(name="exl3_router_fused4", cpp_sources="void router_fused(at::Tensor x, at::Tensor wt, c10::optional<at::Tensor> bias, at::Tensor logits, at::Tensor ctr, at::Tensor sel, at::Tensor rw, int64_t topk, double scale);",
                            cuda_sources=_K_SRC, functions=["router_fused"], build_directory=bd,
                            extra_cuda_cflags=["-O3", "-gencode=arch=compute_103a,code=sm_103a", "-gencode=arch=compute_120a,code=sm_120a"])
     return _ext

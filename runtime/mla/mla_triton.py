@@ -617,6 +617,67 @@ def _mla_absorb_kernel(
 
 
 @triton.jit(do_not_specialize = ["R"])
+def _mla_absorb_rope_kernel(
+    q,                  # (R, H, QK_DIM) fp16 token-major
+    w_uk_flat,          # (D_c, H * D_nope) fp16
+    out,                # (H, R, D_c) fp16 head-major
+    R,                  # runtime
+    q_pe,               # out: (R, H, D_r) fp16 token-major rotated rope queries
+    sincos,             # (R, D_r) fp32: per row the sin of the D_r / 2 rotation pairs, then their cos
+    n_q_heads: tl.constexpr,
+    QK_DIM: tl.constexpr,
+    Q_STRIDE: tl.constexpr,
+    D_nope: tl.constexpr,
+    NOPE_PAD: tl.constexpr,
+    D_c: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    D_r: tl.constexpr,
+    ROPE_GPTJ: tl.constexpr,   # 1: adjacent pairs (GPT-J), 0: half-split pairs (NeoX)
+):
+    """hecate (EXL3_MLA_KVQ): _mla_absorb_kernel plus the query rope. The programs of the first D_c tile also gather
+    their head's rope columns of q, rotate them with the sin/cos table the fused cache-append kernel (mla_kvq.cu) wrote
+    for each row, and store q_pe; this replaces the staging kernel's q_pe gather and the rope kernel's query heads."""
+    HALF: tl.constexpr = D_r // 2
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    head = tl.program_id(2)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    valid_m = offs_m < R
+    offs_k = tl.arange(0, NOPE_PAD)
+    valid_k = offs_k < D_nope
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    q_t = tl.load(q + offs_m[:, None] * Q_STRIDE + head * QK_DIM + offs_k[None, :],
+                  mask = valid_m[:, None] & valid_k[None, :], other = 0.0)
+    w_t = tl.load(w_uk_flat + offs_n[:, None] * (n_q_heads * D_nope) + head * D_nope + offs_k[None, :],
+                  mask = valid_k[None, :], other = 0.0)
+    acc = tl.dot(q_t, tl.trans(w_t))
+    tl.store(out + (head * R + offs_m[:, None]) * D_c + offs_n[None, :],
+             acc.to(tl.float16), mask = valid_m[:, None])
+
+    if pid_n == 0:
+        offs_i = tl.arange(0, HALF)
+        if ROPE_GPTJ:
+            o1 = offs_i * 2
+            o2 = o1 + 1
+        else:
+            o1 = offs_i
+            o2 = offs_i + HALF
+        src = q + offs_m[:, None] * Q_STRIDE + head * QK_DIM + D_nope
+        x1 = tl.load(src + o1[None, :], mask = valid_m[:, None], other = 0.0).to(tl.float32)
+        x2 = tl.load(src + o2[None, :], mask = valid_m[:, None], other = 0.0).to(tl.float32)
+        sn = tl.load(sincos + offs_m[:, None] * D_r + offs_i[None, :], mask = valid_m[:, None], other = 0.0)
+        cs = tl.load(sincos + offs_m[:, None] * D_r + HALF + offs_i[None, :], mask = valid_m[:, None], other = 0.0)
+        r1 = x1 * cs - x2 * sn
+        r2 = x2 * cs + x1 * sn
+        dst = q_pe + (offs_m[:, None] * n_q_heads + head) * D_r
+        tl.store(dst + o1[None, :], r1.to(tl.float16), mask = valid_m[:, None])
+        tl.store(dst + o2[None, :], r2.to(tl.float16), mask = valid_m[:, None])
+
+
+@triton.jit(do_not_specialize = ["R"])
 def _mla_unfold_kernel(
     o_lat,              # (H, R, D_c) fp16 head-major latent attention output
     w_uv_flat,          # (D_c, H * D_v) fp16

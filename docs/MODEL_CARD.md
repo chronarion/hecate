@@ -29,8 +29,8 @@ GGUF or safetensors checkpoint.
 
 | | |
 |---|---|
-| Decode, concurrency 1 (10 prompts × 3 passes, greedy, MTP 3 drafts) | ~148 tok/s |
-| KL divergence vs BF16 (rtx6kpro protocol, 36,848 positions) | 0.0738 (see the benchmarks below) |
+| Decode, concurrency 1 (10 prompts × 3 passes, greedy, MTP 3 drafts) | ~162 tok/s |
+| KL divergence vs BF16 (rtx6kpro protocol, 36,848 positions) | 0.0741 (see the benchmarks below) |
 | Context | 2 × 256K (Q6 KV) by default; one 1M-token conversation with the long-context profile |
 
 ## What is in this repository
@@ -70,12 +70,12 @@ Raw JSON and logs: [`benchmarks/`](https://github.com/chronarion/hecate/tree/mai
 
 | Context | C=1 | C=2 | C=4 | C=8 | C=16 | C=32 |
 |---|---:|---:|---:|---:|---:|---:|
-| 0 | 156 | 201 | 114 | 245 | 153 | 250 |
-| 4K | 118 | 171 | 111 | 244 | - | - |
-| 16K | 126 | 165 | 111 | 240 | - | - |
-| 32K | 119 | 163 | 110 | 240 | - | - |
-| 64K | 116 | 160 | 107 | - | - | - |
-| 128K | 114 | 147 | - | - | - | - |
+| 0 | 156 | 186 | 117 | 247 | 153 | 253 |
+| 4K | 169 | 166 | 115 | 250 | - | - |
+| 16K | 148 | 181 | 113 | 245 | - | - |
+| 32K | 140 | 173 | 114 | 246 | - | - |
+| 64K | 143 | 176 | 109 | - | - | - |
+| 128K | 143 | 165 | - | - | - | - |
 
 Each request gets the aggregate divided by C. Hecate is tuned for one or two conversations: from 4 concurrent requests
 the server trims MTP drafts to stay on the 8-row decode fast path (4: one draft, 8: none); from 16 it leaves that path.
@@ -86,14 +86,14 @@ Past 2,048 tokens of context the model's sparse attention (DSA) takes over. Sing
 
 | Prompt | 1K | 4K | 8K | 16K | 32K | 64K | 128K |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Prefill tok/s | 3,316 | 3,591 | 3,711 | 3,752 | 3,710 | 3,506 | 3,210 |
-| Time to first token | 0.3 s | 1.2 s | 2.2 s | 4.3 s | 8.7 s | 18.4 s | 40.1 s |
+| Prefill tok/s | 3,348 | 3,881 | 4,779 | 4,862 | 4,820 | 4,456 | 3,977 |
+| Time to first token | 0.3 s | 1.1 s | 1.7 s | 3.3 s | 6.7 s | 14.5 s | 32.4 s |
 
 #### Our speed test
 
-10 chat prompts × 3 passes, greedy, 400 tokens, concurrency 1: **~148 tok/s** (151.1 / 148.2 / 148.2 on release 4;
-149.0 / 148.5 / 145.4 on release 3; ~140 on release 2, whose decode step waited ~1.9 ms per step on the host). A 27K-token prompt: prefill 3,790 tok/s,
-then 129 tok/s decode; a 109K-token prompt: prefill 3,370 tok/s, then 122 tok/s (means of 3 runs; single runs vary ±5%).
+10 chat prompts × 3 passes, greedy, 400 tokens, concurrency 1: **~162 tok/s** (164.2 / 159.0 / 162.4 in the 1.4 release
+test; 1.3: ~148). A 27K-token prompt: prefill 4,540 tok/s, then 154 tok/s decode; a 109K-token prompt: prefill 4,160
+tok/s, then 143 tok/s (means of 3 runs; single runs vary ±5%).
 
 #### KLD compared with other GLM-5.3 quants
 
@@ -108,7 +108,7 @@ group shares one exact window set.
 
 | Quant | bpw | KLD | Evaluation set |
 |---|---|---|---|
-| **Hecate** (this release) | 3.8² | **0.0738**¹ | ours: 18 windows, 36,848 positions (wiki, code, chat, math, zh, two 8K windows), verify-shape decode path |
+| **Hecate** (this release) | 3.8² | **0.0741**¹ | ours: 18 windows, 36,848 positions (wiki, code, chat, math, zh, two 8K windows), verify-shape decode path |
 | Infatoshi EXL3 3.0 bpw (scored by us) | 3.04 | 0.1013 | ours, same windows (against the BF16 of its own lineage) |
 | brandonmusic EXL3 TR3 | 3.0 | 0.0979 | 16 sealed windows, 32,752 positions |
 | vcruz305 EXL3 | 3.38 | 0.0948 | own set, 10,240 positions, 1,024-token sequences |

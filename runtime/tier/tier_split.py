@@ -41,6 +41,12 @@ _PF_GROUP = int(os.environ.get("EXL3_PREFILL_GROUP", "24"))     # experts per ba
 # GEMM, the Grace tier read in place), at most EXL3_TIER_P4_NPOS picks per call (scratch ~44 KB per pick); 0 = batched
 # bf16 dequant + grouped GEMMs
 PF4 = os.environ.get("EXL3_TIER_PREFILL_MOE4P", "1") == "1"
+# decode: the handoff kernel (MoE input + routing into the RTX / Grace slots, ISSUE release) runs on a side stream, so the
+# GB300's shared expert and hot band start without it; joined before the combine (the only GB300 consumer of its effects)
+HSIDE = os.environ.get("EXL3_TIER_HSIDE", "0") == "1"
+# EXL3_TIER_COMBINE_NORM=1: a decode MoE layer whose output goes to the next block's fused input norm leaves its combine
+# to that norm: cn.cu waits for the bands, adds the partials, updates the residual and normalizes in one kernel
+COMBINE_NORM = os.environ.get("EXL3_TIER_COMBINE_NORM", "0") == "1"
 NPOS4 = int(os.environ.get("EXL3_TIER_P4_NPOS", "16384"))
 _VG = {"cap": False}   # set by exl3_vgraph while it captures a whole-forward graph (the RTX graph is launched outside)
 H_, I_ = 6144, 2048
@@ -49,6 +55,18 @@ moe4 = _load_ext(name="moe4", sources=[f"{MOE4_SRC}/moe4.cu"], build_directory=_
                  extra_cuda_cflags=["-O3", "-gencode=arch=compute_103a,code=sm_103a", "--use_fast_math"])
 moe4p = _load_ext(name="moe4p", sources=[f"{MOE4_SRC}/moe4p.cu"], build_directory=_bd(f"{BUILD}/build_moe4p"), verbose=False,
                   extra_cuda_cflags=["-O3", "-gencode=arch=compute_103a,code=sm_103a", "--use_fast_math"]) if PF4 else None
+# EXL3_PREFILL_GB300_ROWS > 0: prefill chunks above this many rows run every routed expert on the GB300's tensor cores
+# (_prefill_gb300: moe4t for the int4 tiers, moe3t for the RTX band from its pinned Grace copy); the RTX idles
+moe4t = moe3t = None
+if rs.GB_ROWS > 0:
+    _f = ["-O3", "-gencode=arch=compute_103a,code=sm_103a", "--use_fast_math"]
+    moe4t = _load_ext(name="moe4t", sources=[f"{MOE4_SRC}/moe4t.cu"], build_directory=_bd(f"{BUILD}/build_moe4t"), verbose=False,
+                      extra_cuda_cflags=_f)
+    moe3t = _load_ext(name="moe3t", sources=[os.path.join(os.path.dirname(os.path.abspath(__file__)), "moe3", "moe3t.cu")],
+                      build_directory=_bd(f"{BUILD}/build_moe3t"), verbose=False, extra_cuda_cflags=_f)
+cn = _load_ext(name="cn", sources=[os.path.join(os.path.dirname(os.path.abspath(__file__)), "cn.cu")],
+               build_directory=_bd(f"{BUILD}/build_cn"), verbose=False,
+               extra_cuda_cflags=["-O3", "-gencode=arch=compute_103a,code=sm_103a", "--use_fast_math"]) if COMBINE_NORM else None
 _cb = _load_ext(name="cpuband", sources=[os.path.join(os.path.dirname(os.path.abspath(__file__)), "cpuband.cpp")],
                 build_directory=_bd(f"{BUILD}/build_cpuband"), verbose=False, extra_cflags=["-O3", "-mcpu=neoverse-v2"])
 os.sched_setaffinity(0, set(range(CPU_CORE0)))     # the main thread and its later children stay off the Grace workers
@@ -116,6 +134,7 @@ class _HotShared:
         self.y = torch.zeros(8, H_, dtype=torch.float, device=self.dev)   # hot-band accumulator (decode rows)
         sms = torch.cuda.get_device_properties(self.dev).multi_processor_count
         self.blocks, self.blocks_a = sms * 2, sms * 3
+        self.h_stream = torch.cuda.Stream(self.dev) if HSIDE else None
         self.bytes = self.far_bytes = self.rtx4_bytes = 0
 
 
@@ -205,10 +224,11 @@ def tier_split_load(self, device, **kwargs):
         def _fwd(x, params, out_dtype=None, _m=self, _f=_mf):
             sh0 = _m.shared_experts
             _m._sh_fast = getattr(sh0, "bc", None) is not None and getattr(sh0.bc, "run_bszN", None) is not None
+            _m._prm = params if (COMBINE_NORM and _m._sh_fast and out_dtype is None) else None
             try:
                 return _f(x, params, out_dtype)
             finally:
-                _m.shared_experts = sh0; _m._sh_fast = False
+                _m.shared_experts = sh0; _m._sh_fast = False; _m._prm = None
         self.forward = _fwd
     print(f" -- tier split: {self.key} int4 [0..{hot}) GB300" + (f", int4 [{hot}..{nb}) Grace" if far else "")
           + f", [{first}..{len(perm)}) RTX trellis; int4 {_T.bytes / 1e9:.1f} GB HBM"
@@ -367,6 +387,48 @@ def _hot_prefill4(self, y, sel, rw, out):
     return out
 
 
+def _dev32(a, dev):
+    return torch.from_numpy(a).pin_memory().to(dev, non_blocking=True)
+
+
+def _prefill_gb300(self, y, sel, rw):
+    """Long prefill chunk with every routed expert on the GB300's tensor cores (one host sync for the per-expert counts):
+    the RTX band on moe3t from its pinned Grace copy (rtx_split._host_band, read in place over C2C) on a second stream with
+    its own scratch, overlapping the int4 tiers on moe4t (hot experts from HBM, cold ones read in place over C2C) on the
+    current stream; both add into one fp32 output. Row blocks of <= 256 picks."""
+    Hh, R, T = self._hot, self._rtx, _T
+    K8 = sel.shape[-1]; fs = sel.reshape(-1)
+    order = torch.argsort(fs, stable=True)
+    allc = torch.bincount(fs, minlength=R.E).tolist()
+    out = torch.zeros(y.shape[0], H_, dtype=torch.float, device=y.device)
+    cur = torch.cuda.current_stream(y.device)
+    ps = max(NPOS4, rs.CAP)
+    if getattr(T, "p4scr", None) is None:
+        T.p4scr = (moe4p or moe4t).scratch(y.device, ps)
+    if getattr(T, "gb", None) is None:
+        T.gb = types.SimpleNamespace(stream=torch.cuda.Stream(y.device), scr=moe3t.scratch(y.device, ps))
+    c3 = allc[R.first:]; n3 = sum(c3)
+    if n3:
+        T.gb.stream.wait_stream(cur)
+        with torch.cuda.stream(T.gb.stream):
+            seg = order[fs.numel() - n3:]
+            tok = (seg // K8).int(); eid = (fs[seg] - R.first).int(); wt = rw.reshape(-1)[seg].float()
+            for p0, p1, rbt in rs.pick_groups(c3, ps, 256, True):
+                moe3t.forward(y, tok[p0:p1], eid[p0:p1], wt[p0:p1], _dev32(rbt, y.device), *R.htabs, *T.gb.scr, out)
+    c4 = allc[:Hh.n]; n4 = sum(c4)
+    if n4:
+        gu, ar, d = T.p4scr[0], T.p4scr[1], T.p4scr[2]
+        seg = order[:n4]
+        tok = (seg // K8).int(); eid = fs[seg].int(); wt = rw.reshape(-1)[seg].float()
+        t = Hh.tab
+        for p0, p1, rbt in rs.pick_groups(c4, ps, 256, True):
+            moe4t.forward(y, tok[p0:p1], eid[p0:p1], wt[p0:p1], _dev32(rbt, y.device), t["gate_w"], t["up_w"], t["down_w"],
+                          t["gate_s"], t["up_s"], t["down_s"], gu, ar, d.view(1, ps, H_), out)
+    if n3:
+        cur.wait_stream(T.gb.stream)
+    return out
+
+
 def tier_submit(self, y, bsz, selected_experts, routing_weights):
     L = self._L
     if not _CPU.started and _far(self):
@@ -383,8 +445,18 @@ def tier_submit(self, y, bsz, selected_experts, routing_weights):
             else:
                 _CPU.gen += 1; self._cpu_gen = _CPU.gen
             cpu = (_CPU.ctl_dev + 128, L, _CPU.ctl_dev, self._cpu_gen)
-        rg.handoff(self, y.contiguous(), selected_experts.contiguous(), routing_weights.contiguous(), bsz, moe4, cpu)
+        if HSIDE:
+            hs = _T.h_stream
+            hy, hsel, hrw = y.contiguous(), selected_experts.contiguous(), routing_weights.contiguous()
+            hs.wait_stream(torch.cuda.current_stream(hy.device))
+            with torch.cuda.stream(hs):
+                rg.handoff(self, hy, hsel, hrw, bsz, moe4, cpu)
+            self._h_join = (hy, hsel, hrw)            # kept alive until the join (no allocator reuse under the copy)
+        else:
+            rg.handoff(self, y.contiguous(), selected_experts.contiguous(), routing_weights.contiguous(), bsz, moe4, cpu)
         pend = ("graph", 0, bsz)
+    elif moe3t is not None and bsz > rs.GB_ROWS and getattr(self._rtx, "htabs", None) is not None:
+        pend = ("gb300", 0, bsz)                      # long prefill chunk: every expert on the GB300, the RTX idles
     else:
         _, pend = rs.rtx_submit(self, y, bsz, selected_experts, routing_weights)    # prefill: per-layer RTX path
     T, Hh = _T, self._hot
@@ -399,6 +471,8 @@ def tier_submit(self, y, bsz, selected_experts, routing_weights):
                      Hh.hot if Hh.far else Hh.n, Hh.tab["gate_w"], Hh.tab["up_w"], Hh.tab["down_w"],
                      Hh.tab["gate_s"], Hh.tab["up_s"], Hh.tab["down_s"], *T.scr, yh, T.blocks, T.blocks_a, 0)
         hot = ("main", bsz)
+    elif pend[0] == "gb300":
+        hot = ("pre", _prefill_gb300(self, y, selected_experts.view(bsz, -1), routing_weights.view(bsz, -1)))
     else:
         hot = ("pre", _hot_prefill(self, y, selected_experts.view(bsz, -1), routing_weights.view(bsz, -1)))
     return None, (pend, hot)
@@ -417,9 +491,34 @@ def tier_combine(self, final_hidden_states, cpu_partial, cpu_pending, shape):
             f2 += _T.y[:rows] if hot[0] == "main" else hot[1]
             if hot[0] == "main": _T.y[:rows].zero_()
         return final_hidden_states
+    if pend[0] == "gb300":                         # both bands are in the prefill output
+        f2 += hot[1]
+        return final_hidden_states
     if pend[0] == "graph":                         # one kernel: spin on DONE_L (+ CPU_DONE), add both partials, zero T.y
+        if getattr(self, "_h_join", None) is not None:   # the side-stream handoff (EXL3_TIER_HSIDE)
+            torch.cuda.current_stream(dev).wait_stream(_T.h_stream)
+            self._h_join = None
         o_ptr, done = rg.wait_done(self, dev)
-        moe4.combine(f2, o_ptr, _T.y, rows, _cpu_partial(self, dev, rows), done)
+        o2 = _cpu_partial(self, dev, rows)
+        prm = getattr(self, "_prm", None)
+        if prm is not None and prm.get("mlp_defer_ok") and f2.dtype == torch.float and f2.is_contiguous() and \
+                self.latent_out is None and not self.routed_post_norm and not self.tp_reduce and self.shared_experts is None:
+            # EXL3_TIER_COMBINE_NORM: the next block's input norm runs this combine (runtime/patched/transformer.py)
+            def can(norm, x, _r=rows):
+                w = getattr(norm, "weight", None)
+                return (w is not None and getattr(norm, "groups", 1) == 1 and not getattr(norm, "span_heads", False) and
+                        w.numel() == H_ and w.dtype in (torch.half, torch.bfloat16) and w.is_contiguous() and
+                        x.dtype == torch.float and x.is_contiguous() and x.numel() == _r * H_)
+            def run(_f=f2, _o=o_ptr, _r=rows, _o2=o2, _d=done):
+                moe4.combine(_f, _o, _T.y, _r, _o2, _d)
+            def fused(x, norm, _f=f2, _o=o_ptr, _r=rows, _o2=o2, _d=done):
+                xn = torch.empty((_r, H_), dtype=torch.half, device=_f.device)
+                cn.combine_norm(_f, _o, _T.y, _r, _o2, _d, x.view(_r, H_), norm.weight.data, xn, float(norm.rms_norm_eps),
+                                float(norm.constant_bias), float(norm.constant_scale))
+                return xn.view(x.shape)
+            prm["resid_pending_combine"] = (can, run, fused)
+            return final_hidden_states
+        moe4.combine(f2, o_ptr, _T.y, rows, o2, done)
         return final_hidden_states
     final_hidden_states = rs.rtx_combine(self, final_hidden_states, cpu_partial, pend, shape)
     f2 = final_hidden_states.view(-1, final_hidden_states.shape[-1])
