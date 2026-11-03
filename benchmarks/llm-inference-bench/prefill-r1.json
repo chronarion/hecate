@@ -4,7 +4,7 @@
     "engine": "openai_proxy",
     "model": "base",
     "server": "127.0.0.1:8103",
-    "timestamp": "2026-11-03T12:27:03.010662",
+    "timestamp": "2026-11-03T21:39:51.688155",
     "decode_mode": "duration",
     "primary_decode_layer": "sustained_decode",
     "duration_per_test": 30.0,
@@ -185,12 +185,12 @@
   "event_log": [],
   "prefill": {
     "1024": {
-      "ttft_seconds": 0.343,
-      "prefill_seconds": 0.343,
-      "tok_per_sec": 3365.0,
-      "client_ttft_seconds": 0.343,
-      "client_tok_per_sec": 3365.0,
-      "prompt_tokens": 1154,
+      "ttft_seconds": 0.342,
+      "prefill_seconds": 0.342,
+      "tok_per_sec": 3382.0,
+      "client_ttft_seconds": 0.342,
+      "client_tok_per_sec": 3382.0,
+      "prompt_tokens": 1155,
       "samples": 20,
       "method": "client",
       "server_validation": {
@@ -207,12 +207,12 @@
       "hardware_summary": {}
     },
     "4096": {
-      "ttft_seconds": 1.066,
-      "prefill_seconds": 1.066,
-      "tok_per_sec": 3909.0,
-      "client_ttft_seconds": 1.066,
-      "client_tok_per_sec": 3909.0,
-      "prompt_tokens": 4169,
+      "ttft_seconds": 1.079,
+      "prefill_seconds": 1.079,
+      "tok_per_sec": 3865.0,
+      "client_ttft_seconds": 1.079,
+      "client_tok_per_sec": 3865.0,
+      "prompt_tokens": 4170,
       "samples": 7,
       "method": "client",
       "server_validation": {
@@ -229,11 +229,11 @@
       "hardware_summary": {}
     },
     "8192": {
-      "ttft_seconds": 1.708,
-      "prefill_seconds": 1.708,
-      "tok_per_sec": 4800.0,
-      "client_ttft_seconds": 1.708,
-      "client_tok_per_sec": 4800.0,
+      "ttft_seconds": 1.721,
+      "prefill_seconds": 1.721,
+      "tok_per_sec": 4766.0,
+      "client_ttft_seconds": 1.721,
+      "client_tok_per_sec": 4766.0,
       "prompt_tokens": 8200,
       "samples": 5,
       "method": "client",
@@ -251,12 +251,12 @@
       "hardware_summary": {}
     },
     "16384": {
-      "ttft_seconds": 3.332,
-      "prefill_seconds": 3.332,
-      "tok_per_sec": 4870.0,
-      "client_ttft_seconds": 3.332,
-      "client_tok_per_sec": 4870.0,
-      "prompt_tokens": 16229,
+      "ttft_seconds": 3.362,
+      "prefill_seconds": 3.362,
+      "tok_per_sec": 4827.0,
+      "client_ttft_seconds": 3.362,
+      "client_tok_per_sec": 4827.0,
+      "prompt_tokens": 16227,
       "samples": 3,
       "method": "client",
       "server_validation": {
@@ -273,12 +273,12 @@
       "hardware_summary": {}
     },
     "32768": {
-      "ttft_seconds": 6.661,
-      "prefill_seconds": 6.661,
-      "tok_per_sec": 4852.0,
-      "client_ttft_seconds": 6.661,
-      "client_tok_per_sec": 4852.0,
-      "prompt_tokens": 32322,
+      "ttft_seconds": 6.727,
+      "prefill_seconds": 6.727,
+      "tok_per_sec": 4804.0,
+      "client_ttft_seconds": 6.727,
+      "client_tok_per_sec": 4804.0,
+      "prompt_tokens": 32316,
       "samples": 2,
       "method": "client",
       "server_validation": {
@@ -295,12 +295,12 @@
       "hardware_summary": {}
     },
     "65536": {
-      "ttft_seconds": 13.5,
-      "prefill_seconds": 13.5,
-      "tok_per_sec": 4779.0,
-      "client_ttft_seconds": 13.5,
-      "client_tok_per_sec": 4779.0,
-      "prompt_tokens": 64514,
+      "ttft_seconds": 13.587,
+      "prefill_seconds": 13.587,
+      "tok_per_sec": 4747.0,
+      "client_ttft_seconds": 13.587,
+      "client_tok_per_sec": 4747.0,
+      "prompt_tokens": 64494,
       "samples": 1,
       "method": "client",
       "server_validation": {
@@ -317,12 +317,12 @@
       "hardware_summary": {}
     },
     "131072": {
-      "ttft_seconds": 27.837,
-      "prefill_seconds": 27.837,
-      "tok_per_sec": 4630.0,
-      "client_ttft_seconds": 27.837,
-      "client_tok_per_sec": 4630.0,
-      "prompt_tokens": 128888,
+      "ttft_seconds": 28.001,
+      "prefill_seconds": 28.001,
+      "tok_per_sec": 4602.0,
+      "client_ttft_seconds": 28.001,
+      "client_tok_per_sec": 4602.0,
+      "prompt_tokens": 128854,
       "samples": 1,
       "method": "client",
       "server_validation": {

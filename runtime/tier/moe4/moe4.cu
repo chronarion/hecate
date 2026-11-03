@@ -17,7 +17,9 @@
 //      rows that did not pick the expert) and cleans the scratch
 //   B: down GEMVs (K 2048) of every distinct expert on its act, scaled per row, accumulated across experts into an
 //      fp32 scratch; the last warp per output group adds it into y (fp32, the caller's MoE output) and cleans up.
-// Decode: LOP3 magic number into f16 + HADD2/HFMA2 (exact); x and act read row-major through L1; rows >= R are zero.
+// Decode: LOP3 magic number into f16 + HADD2/HFMA2 (exact); x and act read through L1; rows >= R are zero. act (hot
+// slots) is stored in B-fragment order and x may be (xf): a lane's 8 words of a 64-k block are contiguous, so a unit's
+// activation operand is two 16-byte loads instead of eight 4-byte ones (-2.4 us per call in the interleaved bench).
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -28,7 +30,7 @@ namespace {
 #ifndef PDV
 #define PDV 2
 #endif
-constexpr int H = 6144, I = 2048, SPW = 4, WPB = 8, PD = PDV, TOPK = 8, MAXR = 8, MAXE = 64;
+constexpr int H = 6144, I = 2048, SPW = 4, WPB = 8, PD = PDV, TOPK = 8, MAXR = 8, MAXE = 64, B_PF = 4;
 constexpr int GA = I / (16 * SPW), KA = H / 64;        // phase A: 32 groups x 96 k-blocks per matrix
 constexpr int GB = H / (16 * SPW), KBB = I / 64;       // phase B: 96 groups x 32 k-blocks
 constexpr int UA = 2 * GA * KA, UB = GB * KBB;          // units per expert: 6144 (gate + up), 3072 (down)
@@ -64,6 +66,20 @@ __device__ __forceinline__ void dec8(uint32_t w, uint32_t* a)
     asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a[3]) : "r"(h3), "r"(0x2c002c00u), "r"(0xd480d480u));
 }
 
+// B-fragment order of an fp16 row: word p (k = 2p, 2p + 1) of 64-k block kb = p / 32, within it t = w / 8, q = w % 4,
+// h = (w % 8) / 4 (w = p % 32), sits at kb * 32 + q * 8 + t * 2 + h, so lane q of a quad finds its 8 words of the block
+// (bb[2t + h] of the m16n8k16 B operand) contiguous; a 32-k int8 unit's 4 words are contiguous too
+__device__ __forceinline__ int frag_word(int p) { const int w = p & 31; return (p & ~31) + (w & 3) * 8 + (w >> 3) * 2 + ((w & 7) >> 2); }
+
+// Weight loads that do not allocate in L1: the expert weights stream through once, while x (phase A) and act (phase B)
+// are re-read by every warp and keep L1 to themselves (-2.9 us per call in the interleaved bench, +1.2% served)
+__device__ __forceinline__ uint4 ldw(const uint4* p)
+{
+    uint4 v;
+    asm("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+    return v;
+}
+
 // distinct hot experts of this step (sorted), routing weight per (slot, row); shared by both kernels. Parallel: picks
 // set bits of a 256-bit mask in shared memory, thread 0 turns the mask into the sorted slot list (popc/ffs over 8 words),
 // then every pick adds its weight into its (slot, row) cell. No serialized global loads.
@@ -95,7 +111,7 @@ __device__ void route(const int64_t* sel, const half* rw, int R, int lo, int n_h
 
 // one stream-K pass over `n` units starting at global unit u0; unit -> (slot j, matrix mat, group gr, k-block kb).
 // MATS matrices per expert, G groups x KBN k-blocks per matrix; K = KBN * 64; xsrc(j) gives the B rows.
-template <int MATS, int G, int KBN, typename WPtr, typename XPtr, typename Flush>
+template <int MATS, int G, int KBN, bool XF, typename WPtr, typename XPtr, typename Flush>
 __device__ __forceinline__ void stream(int u0, int n, int R, WPtr wptr, XPtr xptr, Flush flush)
 {
     constexpr int UPM = G * KBN, UPE = MATS * UPM, K = KBN * 64;
@@ -123,13 +139,15 @@ __device__ __forceinline__ void stream(int u0, int n, int R, WPtr wptr, XPtr xpt
     for (int i = 0; i < PD; ++i)
     {
         #pragma unroll
-        for (int s = 0; s < SPW; ++s) ring[i][s] = left > 0 ? __ldg(pp + s * 32) : make_uint4(0, 0, 0, 0);
+        for (int s = 0; s < SPW; ++s) ring[i][s] = left > 0 ? ldw(pp + s * 32) : make_uint4(0, 0, 0, 0);
 #ifdef V7_XPF
         if (left > 0) xload(xring[i]);
 #endif
         if (left > 0) advance_p();
     }
-    const uint32_t* xr = (const uint32_t*) (xptr(j) + (size_t) (live ? xn : 0) * K + kq);
+    auto xrow = [&](int jx) { return XF ? (const uint32_t*) (xptr(jx) + (size_t) (live ? xn : 0) * K) + (lane % 4) * 8
+                                        : (const uint32_t*) (xptr(jx) + (size_t) (live ? xn : 0) * K + kq); };
+    const uint32_t* xr = xrow(j);
     bool whole = kb == 0;
     float c[SPW][4];
     #pragma unroll
@@ -142,25 +160,34 @@ __device__ __forceinline__ void stream(int u0, int n, int R, WPtr wptr, XPtr xpt
             if (done + jj >= n) break;
             const bool more = left > 0;
             uint32_t bb[8];
-#ifdef V7_XPF
-            #pragma unroll
-            for (int t = 0; t < 8; ++t) bb[t] = xring[jj][t];
-            if (more) xload(xring[jj]);
-#else
-            #pragma unroll
-            for (int t = 0; t < 4; ++t)
+            if (XF)
             {
-                const int k0 = kb * 64 + t * 16;
-                bb[2 * t] = live ? __ldg(xr + k0 / 2) : 0u; bb[2 * t + 1] = live ? __ldg(xr + k0 / 2 + 4) : 0u;
+                const uint4 v0 = live ? __ldg((const uint4*) (xr + kb * 32)) : make_uint4(0, 0, 0, 0);
+                const uint4 v1 = live ? __ldg((const uint4*) (xr + kb * 32) + 1) : make_uint4(0, 0, 0, 0);
+                bb[0] = v0.x; bb[1] = v0.y; bb[2] = v0.z; bb[3] = v0.w; bb[4] = v1.x; bb[5] = v1.y; bb[6] = v1.z; bb[7] = v1.w;
             }
+            else
+            {
+#ifdef V7_XPF
+                #pragma unroll
+                for (int t = 0; t < 8; ++t) bb[t] = xring[jj][t];
+                if (more) xload(xring[jj]);
+#else
+                #pragma unroll
+                for (int t = 0; t < 4; ++t)
+                {
+                    const int k0 = kb * 64 + t * 16;
+                    bb[2 * t] = live ? __ldg(xr + k0 / 2) : 0u; bb[2 * t + 1] = live ? __ldg(xr + k0 / 2 + 4) : 0u;
+                }
 #endif
+            }
             #pragma unroll
             for (int s = 0; s < SPW; ++s)
             {
                 const uint32_t ww[4] = {ring[jj][s].x, ring[jj][s].y, ring[jj][s].z, ring[jj][s].w};
                 #pragma unroll
                 for (int t = 0; t < 4; ++t) { uint32_t a[4]; dec8(ww[t], a); mma16816(c[s], a, bb[2 * t], bb[2 * t + 1]); }
-                if (more) ring[jj][s] = __ldg(pp + s * 32);
+                if (more) ring[jj][s] = ldw(pp + s * 32);
             }
             if (more) advance_p();
             ++kb;
@@ -174,7 +201,7 @@ __device__ __forceinline__ void stream(int u0, int n, int R, WPtr wptr, XPtr xpt
                 {
                     kb = 0;
                     if (++gr == G) { gr = 0; if (++mat == MATS) { mat = 0; ++j; } }
-                    if (done + jj < n - 1) xr = (const uint32_t*) (xptr(j) + (size_t) (live ? xn : 0) * K + kq);
+                    if (done + jj < n - 1) xr = xrow(j);
                 }
             }
         }
@@ -183,7 +210,7 @@ __device__ __forceinline__ void stream(int u0, int n, int R, WPtr wptr, XPtr xpt
 
 
 // stream() over int8 units (64 rows x 32 k): the same cursors, ring and flush protocol, the dense GEMV's decode / MMAs
-template <int MATS, int G, int KBN, typename WPtr, typename XPtr, typename Flush>
+template <int MATS, int G, int KBN, bool XF, typename WPtr, typename XPtr, typename Flush>
 __device__ __forceinline__ void stream_i8(int u0, int n, int R, WPtr wptr, XPtr xptr, Flush flush)
 {
     constexpr int UPM = G * KBN, UPE = MATS * UPM, K = KBN * 32;
@@ -202,10 +229,12 @@ __device__ __forceinline__ void stream_i8(int u0, int n, int R, WPtr wptr, XPtr 
     for (int i = 0; i < PD; ++i)
     {
         #pragma unroll
-        for (int s = 0; s < SPW; ++s) ring[i][s] = left > 0 ? __ldg(pp + s * 32) : make_uint4(0, 0, 0, 0);
+        for (int s = 0; s < SPW; ++s) ring[i][s] = left > 0 ? ldw(pp + s * 32) : make_uint4(0, 0, 0, 0);
         if (left > 0) advance_p();
     }
-    const uint32_t* xr = (const uint32_t*) (xptr(j) + (size_t) (live ? xn : 0) * K + kq);
+    auto xrow = [&](int jx) { return XF ? (const uint32_t*) (xptr(jx) + (size_t) (live ? xn : 0) * K) + (lane % 4) * 8
+                                        : (const uint32_t*) (xptr(jx) + (size_t) (live ? xn : 0) * K + kq); };
+    const uint32_t* xr = xrow(j);
     bool whole = kb == 0;
     float c[SPW][4];
     #pragma unroll
@@ -218,11 +247,19 @@ __device__ __forceinline__ void stream_i8(int u0, int n, int R, WPtr wptr, XPtr 
             if (done + jj >= n) break;
             const bool more = left > 0;
             uint32_t bb[4];
-            #pragma unroll
-            for (int t = 0; t < 2; ++t)
+            if (XF)          // the unit's 4 words: half (kb % 2) of the lane's 8-word slot of 64-k block kb / 2
             {
-                const int k0 = kb * 32 + t * 16;
-                bb[2 * t] = live ? __ldg(xr + k0 / 2) : 0u; bb[2 * t + 1] = live ? __ldg(xr + k0 / 2 + 4) : 0u;
+                const uint4 v = live ? __ldg((const uint4*) (xr + (kb / 2) * 32 + (kb % 2) * 4)) : make_uint4(0, 0, 0, 0);
+                bb[0] = v.x; bb[1] = v.y; bb[2] = v.z; bb[3] = v.w;
+            }
+            else
+            {
+                #pragma unroll
+                for (int t = 0; t < 2; ++t)
+                {
+                    const int k0 = kb * 32 + t * 16;
+                    bb[2 * t] = live ? __ldg(xr + k0 / 2) : 0u; bb[2 * t + 1] = live ? __ldg(xr + k0 / 2 + 4) : 0u;
+                }
             }
             #pragma unroll
             for (int s = 0; s < SPW; ++s)
@@ -230,7 +267,7 @@ __device__ __forceinline__ void stream_i8(int u0, int n, int R, WPtr wptr, XPtr 
                 const uint32_t ww[4] = {ring[jj][s].x, ring[jj][s].y, ring[jj][s].z, ring[jj][s].w};
                 #pragma unroll
                 for (int t = 0; t < 2; ++t) { uint32_t a[4]; dec_i8(ww[2 * t], a); dec_i8(ww[2 * t + 1], a + 2); mma16816(c[s], a, bb[2 * t], bb[2 * t + 1]); }
-                if (more) ring[jj][s] = __ldg(pp + s * 32);
+                if (more) ring[jj][s] = ldw(pp + s * 32);
             }
             if (more) advance_p();
             ++kb;
@@ -244,7 +281,7 @@ __device__ __forceinline__ void stream_i8(int u0, int n, int R, WPtr wptr, XPtr 
                 {
                     kb = 0;
                     if (++gr == G) { gr = 0; if (++mat == MATS) { mat = 0; ++j; } }
-                    if (done + jj < n - 1) xr = (const uint32_t*) (xptr(j) + (size_t) (live ? xn : 0) * K + kq);
+                    if (done + jj < n - 1) xr = xrow(j);
                 }
             }
         }
@@ -321,9 +358,11 @@ __device__ __forceinline__ void stream_cp(int u0, int n, int R, WPtr wptr, XPtr 
 
 __device__ __forceinline__ int splits(int ua, int ub, int upw) { return ub / upw - ua / upw + 1; }
 
+template <bool XF>
 __global__ void __launch_bounds__(WPB * 32, 2) moe4_a_kernel
 (
-    const half* __restrict__ x, const int64_t* __restrict__ sel, const half* __restrict__ rw, int R, int lo, int n_hot,
+    const half* __restrict__ x,      // [R][H], row-major or (XF) in B-fragment order
+    const int64_t* __restrict__ sel, const half* __restrict__ rw, int R, int lo, int n_hot,
     const int64_t* __restrict__ gate_w, const int64_t* __restrict__ up_w,
     const int64_t* __restrict__ gate_s, const int64_t* __restrict__ up_s,
     half* __restrict__ act,          // [MAXE][MAXR][I]
@@ -389,7 +428,7 @@ __global__ void __launch_bounds__(WPB * 32, 2) moe4_a_kernel
         if (lane == 0) ctr[j * GA + gr] = 0;
     };
 #ifdef V7_REGRING
-    if (nh > 0) stream<2, GA, KA>(u0, nh, R, wptr, xptr, flush);
+    if (nh > 0) stream<2, GA, KA, XF>(u0, nh, R, wptr, xptr, flush);
 #else
     if (nh > 0) stream_cp<2, GA, KA>(u0, nh, R, wptr, xptr, flush, ring_s + (size_t) (threadIdx.x / 32) * STAGES * SPW * 32);
 #endif
@@ -397,7 +436,7 @@ __global__ void __launch_bounds__(WPB * 32, 2) moe4_a_kernel
     {
         auto wsh = [&](int, int mat) { return mat ? sh_uw : sh_gw; };
         auto fsh = [&](int, int mat, int gr, float (*c)[4], bool w) { flush(m, mat, gr, c, w); };
-        stream_i8<2, GA, KSA>(u0 + nh - uh, n - nh, R, wsh, xptr, fsh);
+        stream_i8<2, GA, KSA, XF>(u0 + nh - uh, n - nh, R, wsh, xptr, fsh);
     }
 }
 
@@ -418,10 +457,13 @@ __global__ void __launch_bounds__(WPB * 32, 2) moe4_b_kernel
 #ifdef V7_SKIP_B
     return;
 #endif
-    route(sel, rw, R, lo, n_hot, rt);
 #ifdef V7_PDL
-    asm volatile("griddepcontrol.wait;" ::: "memory");
+    // the layer's combine-norm (EXL3_CN_PDL) may launch now as a programmatic dependent: its CTAs become resident as B's
+    // retire, wait for the bands and load their operands, and read y only after griddepcontrol.wait (a no-op for a
+    // plain launch after B)
+    asm volatile("griddepcontrol.launch_dependents;");
 #endif
+    route(sel, rw, R, lo, n_hot, rt);
     const int m = rt.m;
     const int UG = m * KBB, th = GB * UG, total = th + (sh_dw ? USB : 0), nwarps = gridDim.x * WPB;
     if (total == 0) return;
@@ -429,6 +471,22 @@ __global__ void __launch_bounds__(WPB * 32, 2) moe4_b_kernel
     const int u0 = gw * upw, n_all = min(total - u0, upw);
     const int lane = threadIdx.x % 32;
     const int n = min(n_all, max(0, th - u0));                    // hot units of this warp; the rest are the shared expert's
+    // the weights and the routing do not depend on act: before griddepcontrol.wait, lane 0 prefetches the warp's first
+    // B_PF units (in consumption order: shared-expert units, then hot) into L2 while act finishes (-0.9 us per call)
+    if (lane == 0 && n_all > 0)
+    {
+        const int ns = n_all - n;
+        for (int i = 0; i < B_PF && i < n_all; ++i)
+        {
+            const uint4* p;
+            if (i < ns) p = sh_dw + (size_t) (max(u0, th) - th + i) * 128;
+            else { const int u = u0 + (i - ns), g = u / UG, jj = (u % UG) / KBB, kbx = u % KBB; p = (const uint4*) down_w[rt.e[jj]] + ((size_t) g * KBB + kbx) * 128; }
+            asm volatile("cp.async.bulk.prefetch.L2.global [%0], 2048;" :: "l"(p) : "memory");
+        }
+    }
+#ifdef V7_PDL
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
     if (n_all > n && n_all > 0)
     {
         // shared expert down: int8 units (group, k-block) on act slot m, scaled per row, added into y
@@ -443,7 +501,7 @@ __global__ void __launch_bounds__(WPB * 32, 2) moe4_b_kernel
             }
         };
         const half* ash = act + (size_t) m * MAXR * I;
-        stream_i8<1, GB, KSB>(max(u0, th) - th, n_all - n, R, [&](int, int) { return sh_dw; }, [&](int) { return ash; }, fdn);
+        stream_i8<1, GB, KSB, false>(max(u0, th) - th, n_all - n, R, [&](int, int) { return sh_dw; }, [&](int) { return ash; }, fdn);
     }
     if (n <= 0) return;
     int gr = u0 / UG, j = (u0 % UG) / KBB, kb = u0 % KBB;
@@ -457,7 +515,7 @@ __global__ void __launch_bounds__(WPB * 32, 2) moe4_b_kernel
     };
     uint4 ring[PD][SPW];
     const int xn = lane / 4, kq = (lane % 4) * 2; const bool live = xn < R;
-    auto xrow = [&](int jj) { return (const uint32_t*) (act + ((size_t) jj * MAXR + (live ? xn : 0)) * I + kq); };
+    auto xrow = [&](int jj) { return (const uint32_t*) (act + ((size_t) jj * MAXR + (live ? xn : 0)) * I) + (lane % 4) * 8; };
 #ifdef V7_XPF
     uint32_t xring[PD][8];
     auto xload = [&](uint32_t* d) {
@@ -470,7 +528,7 @@ __global__ void __launch_bounds__(WPB * 32, 2) moe4_b_kernel
     for (int i = 0; i < PD; ++i)
     {
         #pragma unroll
-        for (int s = 0; s < SPW; ++s) ring[i][s] = left > 0 ? __ldg(pp + s * 32) : make_uint4(0, 0, 0, 0);
+        for (int s = 0; s < SPW; ++s) ring[i][s] = left > 0 ? ldw(pp + s * 32) : make_uint4(0, 0, 0, 0);
 #ifdef V7_XPF
         if (left > 0) xload(xring[i]);
 #endif
@@ -503,11 +561,10 @@ __global__ void __launch_bounds__(WPB * 32, 2) moe4_b_kernel
             for (int t = 0; t < 8; ++t) bb[t] = xring[jj][t];
             if (more) xload(xring[jj]);
 #else
-            #pragma unroll
-            for (int t = 0; t < 4; ++t)
-            {
-                const int k0 = kb * 64 + t * 16;
-                bb[2 * t] = live ? __ldg(xr + k0 / 2) : 0u; bb[2 * t + 1] = live ? __ldg(xr + k0 / 2 + 4) : 0u;
+            {     // act in B-fragment order (moe4_act_kernel)
+                const uint4 v0 = live ? __ldg((const uint4*) (xr + kb * 32)) : make_uint4(0, 0, 0, 0);
+                const uint4 v1 = live ? __ldg((const uint4*) (xr + kb * 32) + 1) : make_uint4(0, 0, 0, 0);
+                bb[0] = v0.x; bb[1] = v0.y; bb[2] = v0.z; bb[3] = v0.w; bb[4] = v1.x; bb[5] = v1.y; bb[6] = v1.z; bb[7] = v1.w;
             }
 #endif
             #pragma unroll
@@ -516,7 +573,7 @@ __global__ void __launch_bounds__(WPB * 32, 2) moe4_b_kernel
                 const uint32_t ww[4] = {ring[jj][s].x, ring[jj][s].y, ring[jj][s].z, ring[jj][s].w};
                 #pragma unroll
                 for (int t = 0; t < 4; ++t) { uint32_t a[4]; dec8(ww[t], a); mma16816(c[s], a, bb[2 * t], bb[2 * t + 1]); }
-                if (more) ring[jj][s] = __ldg(pp + s * 32);
+                if (more) ring[jj][s] = ldw(pp + s * 32);
             }
             if (more) advance_p();
             ++kb;
@@ -606,9 +663,14 @@ __global__ void __launch_bounds__(256) moe4_act_kernel(const int64_t* __restrict
         const float4 gs = *(const float4*) (gsp + i), us = *(const float4*) (usp + i);
         const float w = j < m ? rt.w[j][r] : 1.f;
         auto f = [&](float g, float s1, float u, float s2) { g *= s1; return __float2half(g / (1.f + __expf(-g)) * u * s2 * w); };
-        half2* ap = (half2*) (act + ((size_t) j * MAXR + r) * I + i);
-        ap[0] = __halves2half2(f(g4.x, gs.x, u4.x, us.x), f(g4.y, gs.y, u4.y, us.y));
-        ap[1] = __halves2half2(f(g4.z, gs.z, u4.z, us.z), f(g4.w, gs.w, u4.w, us.w));
+        const half2 h0 = __halves2half2(f(g4.x, gs.x, u4.x, us.x), f(g4.y, gs.y, u4.y, us.y));
+        const half2 h1 = __halves2half2(f(g4.z, gs.z, u4.z, us.z), f(g4.w, gs.w, u4.w, us.w));
+        if (j < m)           // hot slots in B-fragment order; the shared expert's slot m stays row-major (int8 down path)
+        {
+            uint32_t* aw = (uint32_t*) (act + ((size_t) j * MAXR + r) * I);
+            aw[frag_word(i / 2)] = *(const uint32_t*) &h0; aw[frag_word(i / 2 + 1)] = *(const uint32_t*) &h1;
+        }
+        else { half2* ap = (half2*) (act + ((size_t) j * MAXR + r) * I + i); ap[0] = h0; ap[1] = h1; }
         *(float4*) gp = make_float4(0.f, 0.f, 0.f, 0.f); *(float4*) up = make_float4(0.f, 0.f, 0.f, 0.f);
     }
 }
@@ -761,14 +823,14 @@ void moe4_combine(torch::Tensor f, int64_t o_ptr, torch::Tensor y, int64_t rows,
         (const float*) o_ptr, y.data_ptr<float>(), n, (const float*) o2_ptr, (const unsigned*) done_ptr);
 }
 
-// x [R][H] fp16, sel [R][8] int32 (hot-band local ids, others ignored), rw [R][8] fp16; tables int64 [n_hot] device
-// pointers; y [R][H] fp32 accumulated into. Scratch from moe4_scratch().
+// x [R][H] fp16 (xf = 1: in B-fragment order, as nr4 writes it), sel [R][8] int32 (hot-band local ids, others ignored),
+// rw [R][8] fp16; tables int64 [n_hot] device pointers; y [R][H] fp32 accumulated into. Scratch from moe4_scratch().
 void moe4_forward(torch::Tensor x, torch::Tensor sel, torch::Tensor rw, int64_t n_hot,
                   torch::Tensor gate_w, torch::Tensor up_w, torch::Tensor down_w,
                   torch::Tensor gate_s, torch::Tensor up_s, torch::Tensor down_s,
                   torch::Tensor act, torch::Tensor gu32, torch::Tensor ctr_a, torch::Tensor y32, torch::Tensor ctr_b,
                   torch::Tensor y, int64_t blocks, int64_t blocks_a, int64_t lo,
-                  int64_t sh_gw, int64_t sh_uw, int64_t sh_dw, int64_t sh_gs, int64_t sh_us, int64_t sh_ds)
+                  int64_t sh_gw, int64_t sh_uw, int64_t sh_dw, int64_t sh_gs, int64_t sh_us, int64_t sh_ds, int64_t xf)
 {
     // hecate (EXL3_TIER_SH_MOE4): the shared expert's int8 weights (dense GEMV fragment order) and fp32 row scales; 0 = none
     const uint4* shg = (const uint4*) sh_gw; const uint4* shu = (const uint4*) sh_uw; const uint4* shd = (const uint4*) sh_dw;
@@ -785,7 +847,12 @@ void moe4_forward(torch::Tensor x, torch::Tensor sel, torch::Tensor rw, int64_t 
     constexpr int SMEM_A = WPB * STAGES * SPW * 32 * 16;
 #endif
     static bool attr = false;
-    if (!attr) { cudaFuncSetAttribute(moe4_a_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_A); attr = true; }
+    if (!attr)
+    {
+        cudaFuncSetAttribute(moe4_a_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_A);
+        cudaFuncSetAttribute(moe4_a_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_A);
+        attr = true;
+    }
 #ifdef V7_PDL
     cudaLaunchAttribute la[1];
     la[0].id = cudaLaunchAttributeProgrammaticStreamSerialization; la[0].val.programmaticStreamSerializationAllowed = 1;
@@ -793,7 +860,8 @@ void moe4_forward(torch::Tensor x, torch::Tensor sel, torch::Tensor rw, int64_t 
                                       c.stream = st; c.attrs = la; c.numAttrs = 1; return c; };
     {
         cudaLaunchConfig_t c = cfg((int) blocks, SMEM_A);   // 2 blocks / SM (register ring); blocks_a is the v4 cp.async grid
-        cudaLaunchKernelEx(&c, moe4_a_kernel, (const half*) x.data_ptr(), (const int64_t*) sel.data_ptr<int64_t>(), (const half*) rw.data_ptr(),
+        cudaLaunchKernelEx(&c, xf ? moe4_a_kernel<true> : moe4_a_kernel<false>, (const half*) x.data_ptr(),
+            (const int64_t*) sel.data_ptr<int64_t>(), (const half*) rw.data_ptr(),
             R, (int) lo, (int) n_hot, (const int64_t*) gate_w.data_ptr<int64_t>(), (const int64_t*) up_w.data_ptr<int64_t>(),
             (const int64_t*) gate_s.data_ptr<int64_t>(), (const int64_t*) up_s.data_ptr<int64_t>(), (half*) act.data_ptr(), gu32.data_ptr<float>(),
             ctr_a.data_ptr<int>(), shg, shu);
@@ -808,7 +876,8 @@ void moe4_forward(torch::Tensor x, torch::Tensor sel, torch::Tensor rw, int64_t 
         return;
     }
 #endif
-    moe4_a_kernel<<<(int) blocks_a, WPB * 32, SMEM_A, st>>>((const half*) x.data_ptr(), sel.data_ptr<int64_t>(), (const half*) rw.data_ptr(),
+    TORCH_CHECK(!xf, "moe4: fragment-order x needs V7_PDL");
+    moe4_a_kernel<false><<<(int) blocks_a, WPB * 32, SMEM_A, st>>>((const half*) x.data_ptr(), sel.data_ptr<int64_t>(), (const half*) rw.data_ptr(),
         R, (int) lo, (int) n_hot, gate_w.data_ptr<int64_t>(), up_w.data_ptr<int64_t>(), gate_s.data_ptr<int64_t>(), up_s.data_ptr<int64_t>(),
         (half*) act.data_ptr(), gu32.data_ptr<float>(), ctr_a.data_ptr<int>(), shg, shu);
 #if defined(V7_A_RED) && !defined(V7_NO_ACT)
@@ -847,7 +916,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("forward", &moe4_forward, "forward", py::arg("x"), py::arg("sel"), py::arg("rw"), py::arg("n_hot"), py::arg("gate_w"),
           py::arg("up_w"), py::arg("down_w"), py::arg("gate_s"), py::arg("up_s"), py::arg("down_s"), py::arg("act"), py::arg("gu32"),
           py::arg("ctr_a"), py::arg("y32"), py::arg("ctr_b"), py::arg("y"), py::arg("blocks"), py::arg("blocks_a"), py::arg("lo"),
-          py::arg("sh_gw") = 0, py::arg("sh_uw") = 0, py::arg("sh_dw") = 0, py::arg("sh_gs") = 0, py::arg("sh_us") = 0, py::arg("sh_ds") = 0);
+          py::arg("sh_gw") = 0, py::arg("sh_uw") = 0, py::arg("sh_dw") = 0, py::arg("sh_gs") = 0, py::arg("sh_us") = 0, py::arg("sh_ds") = 0,
+          py::arg("xf") = 0);
     m.def("scratch", &moe4_scratch);
     m.def("combine", &moe4_combine);
     m.def("handoff", &moe4_handoff);

@@ -29,6 +29,34 @@ __global__ void release_k(unsigned* f, unsigned v)
     __threadfence_system();
     asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(f), "r"(v) : "memory");
 }
+// hecate (EXL3_RTX_STAGE1): wait for the layer's ISSUE and copy its slot (rows y, selection, weights; pinned host memory
+// written by the GB300) into the RTX VRAM staging buffers in one kernel: the three copy-engine nodes it replaces cost
+// ~14 us from ISSUE to the first RTX kernel (node transitions), this kernel ~one PCIe round trip. ISSUE is reset after
+// the copy (the next release of this layer's ISSUE is a step later)
+__global__ void __launch_bounds__(1024) wait_stage_k(unsigned* f, const uint4* ys, const uint4* ss, const uint4* ws,
+                                                     uint4* yd, uint4* sd, uint4* wd, int ny, int ns, int nw)
+{
+    if (threadIdx.x == 0)
+    {
+        unsigned v;
+        do { asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(f) : "memory"); if (v < 1u) __nanosleep(200); } while (v < 1u);
+    }
+    __syncthreads();
+    uint4 a = {}, b = {};
+    if (threadIdx.x < ns) a = __ldcv(ss + threadIdx.x);
+    if (threadIdx.x < nw) b = __ldcv(ws + threadIdx.x);
+    for (int base = 0; base < ny; base += 4 * 1024)          // all loads of a 64 KB batch in flight before its stores
+    {
+        uint4 t[4];
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) { const int i = base + threadIdx.x + k * 1024; if (i < ny) t[k] = __ldcv(ys + i); }
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) { const int i = base + threadIdx.x + k * 1024; if (i < ny) yd[i] = t[k]; }
+    }
+    if (threadIdx.x < ns) sd[threadIdx.x] = a;
+    if (threadIdx.x < nw) wd[threadIdx.x] = b;
+    if (threadIdx.x == 0) { *(volatile unsigned*) f = 0u; __threadfence_system(); }
+}
 void wait_reset(int64_t f, int64_t want, int64_t reset, int64_t dev)
 {
     const at::cuda::CUDAGuard g((c10::DeviceIndex) dev);
@@ -39,10 +67,20 @@ void release(int64_t f, int64_t v, int64_t dev)
     const at::cuda::CUDAGuard g((c10::DeviceIndex) dev);
     release_k<<<1, 1, 0, at::cuda::getCurrentCUDAStream().stream()>>>((unsigned*) f, (unsigned) v);
 }
+// byte counts must be multiples of 16 (the selection and weights at most 16 KB each)
+void wait_stage(int64_t f, int64_t ys, int64_t ss, int64_t ws, int64_t yd, int64_t sd, int64_t wd, int64_t ny, int64_t ns, int64_t nw, int64_t dev)
+{
+    TORCH_CHECK(ny % 16 == 0 && ns % 16 == 0 && nw % 16 == 0 && ns <= 1024 * 16 && nw <= 1024 * 16, "wait_stage: sizes");
+    const at::cuda::CUDAGuard g((c10::DeviceIndex) dev);
+    wait_stage_k<<<1, 1024, 0, at::cuda::getCurrentCUDAStream().stream()>>>((unsigned*) f, (const uint4*) ys, (const uint4*) ss,
+        (const uint4*) ws, (uint4*) yd, (uint4*) sd, (uint4*) wd, (int) (ny / 16), (int) (ns / 16), (int) (nw / 16));
+}
 """
 _BD = os.path.join(os.environ.get("EXL3_TIER_BUILD", os.environ.get("EXL3_MOE4_SRC", "/opt/moe4")), "build_rtxflags"); os.makedirs(_BD, exist_ok=True)
-_fk = load_inline(name="rtxflags", cpp_sources="void wait_reset(int64_t f, int64_t want, int64_t reset, int64_t dev);\n"
-                  "void release(int64_t f, int64_t v, int64_t dev);", cuda_sources=_SRC, functions=["wait_reset", "release"],
+_fk = load_inline(name="rtxflags2", cpp_sources="void wait_reset(int64_t f, int64_t want, int64_t reset, int64_t dev);\n"
+                  "void release(int64_t f, int64_t v, int64_t dev);\n"
+                  "void wait_stage(int64_t f, int64_t ys, int64_t ss, int64_t ws, int64_t yd, int64_t sd, int64_t wd, int64_t ny, "
+                  "int64_t ns, int64_t nw, int64_t dev);", cuda_sources=_SRC, functions=["wait_reset", "release", "wait_stage"],
                   build_directory=_BD,
                   extra_cuda_cflags=["-O3", "-gencode=arch=compute_103a,code=sm_103a", "-gencode=arch=compute_120a,code=sm_120a"])
 
@@ -97,6 +135,8 @@ class _Slots:
 
 
 _RTX_STAGE = os.environ.get("EXL3_RTX_STAGE", "1") == "1"   # stage the slot (x / sel / rw) into RTX VRAM per layer
+# EXL3_RTX_STAGE1=1: the ISSUE wait and the slot copy as one kernel (wait_stage_k) instead of wait_reset_k + 3 copy nodes
+_RTX_STAGE1 = _RTX_STAGE and os.environ.get("EXL3_RTX_STAGE1", "0") == "1"
 
 
 class _Graph:
@@ -146,9 +186,14 @@ class _Graph:
         with torch.cuda.device(S.r), torch.cuda.graph(g, stream=S.stream):
             for i, m in enumerate(MODS):
                 v, Rt = sv[i], m._rtx; T = Rt.tabs
-                _fk.wait_reset(v["issue"], 1, 0, ri)
                 yin, sin, win = v["y"], v["s"], v["w"]
-                if _RTX_STAGE:       # one bulk PCIe read of the slot instead of per-warp reads in the coop kernels
+                if _RTX_STAGE1:
+                    yin, sin, win = self.stage_y[:R], self.stage_s[:R], self.stage_w[:R]
+                    _fk.wait_stage(v["issue"], v["y"].data_ptr(), v["s"].data_ptr(), v["w"].data_ptr(), yin.data_ptr(),
+                                   sin.data_ptr(), win.data_ptr(), yin.numel() * 2, sin.numel() * 8, win.numel() * 2, ri)
+                else:
+                    _fk.wait_reset(v["issue"], 1, 0, ri)
+                if _RTX_STAGE and not _RTX_STAGE1:   # one bulk PCIe read of the slot instead of per-warp reads in the coop kernels
                     yin, sin, win = self.stage_y[:R], self.stage_s[:R], self.stage_w[:R]
                     yin.copy_(v["y"][:R]); sin.copy_(v["s"][:R]); win.copy_(v["w"][:R])
                 r4, sh = getattr(m, "_rtx4", None), None

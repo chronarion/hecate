@@ -21,6 +21,8 @@
 // fences them at system scope before its cluster barrier; the last leader writes the selection and weights into the
 // slot, the Grace job header, resets the layer's RTX DONE, fences, and releases the RTX and Grace ISSUE flags, as
 // moe4_handoff does one kernel later.
+// x2f (EXL3_MOE4_XF): cluster 0 also writes the normed rows in moe4's B-fragment order (a lane's 8 words of each 64-k
+// block contiguous), which moe4 phase A reads with two 16-byte loads per unit.
 #pragma once
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -50,6 +52,7 @@ struct Params
     float eps, cbias, cscale, scale;
     half* hy; int64_t* hs; half* hw;                  // handoff slot (nullptr: no handoff)
     unsigned* hflag; unsigned hgen; unsigned* hmeta; unsigned hm0; unsigned* hflag2; unsigned hgen2; unsigned* hzero;
+    half* x2f;               // the normed rows again in moe4's B-fragment order (nullptr: none)
 #ifdef NR_STAMPS
     unsigned long long* st;
 #endif
@@ -92,8 +95,9 @@ __device__ __forceinline__ float4 add4(const float4& a, const float4& b)
     return s;
 }
 
-// x * (w + cbias) * rmf -> fp16, into the shared slice and (cluster 0) the output rows and the handoff slot
-__device__ __forceinline__ void out4(float4 s, float4 w, float cbias, float rmf, half* g, half* sm, half* h)
+// x * (w + cbias) * rmf -> fp16, into the shared slice and (cluster 0) the output rows, the handoff slot and the
+// fragment-order copy (gf = that row, e = the first of the 4 columns: words e / 2, e / 2 + 1 -> moe4's frag_word)
+__device__ __forceinline__ void out4(float4 s, float4 w, float cbias, float rmf, half* g, half* sm, half* h, half* gf = nullptr, int e = 0)
 {
     if (cbias != 0.0f) { w.x += cbias; w.y += cbias; w.z += cbias; w.w += cbias; }
     s.x = s.x * w.x * rmf; s.y = s.y * w.y * rmf; s.z = s.z * w.z * rmf; s.w = s.w * w.w * rmf;
@@ -101,6 +105,16 @@ __device__ __forceinline__ void out4(float4 s, float4 w, float cbias, float rmf,
     const half2 h1 = __halves2half2(__float2half_rn(s.z), __float2half_rn(s.w));
     if (g) { ((half2*) g)[0] = h0; ((half2*) g)[1] = h1; }
     if (h) { ((half2*) h)[0] = h0; ((half2*) h)[1] = h1; }
+    if (gf)
+    {
+        uint32_t* gw = (uint32_t*) gf;
+        #pragma unroll
+        for (int i = 0; i < 2; ++i)
+        {
+            const int p = e / 2 + i, wq = p & 31;
+            gw[(p & ~31) + (wq & 3) * 8 + (wq >> 3) * 2 + ((wq & 7) >> 2)] = i ? *(const uint32_t*) &h1 : *(const uint32_t*) &h0;
+        }
+    }
     ((half2*) sm)[0] = h0; ((half2*) sm)[1] = h1;
 }
 
@@ -137,11 +151,17 @@ __global__ void __launch_bounds__(NT, 1) nr4_kernel(const Params p)
     const int ea = chunk_base(c, ja) + 4 * lane, eb = chunk_base(c, 1) + 4 * lane;
     const size_t ro = (size_t) m * DIM;
     float4 ya = {}, ra = {}, yb = {}, rb = {}, wa = {}, wb = {};
+#ifdef NR4_PDLW
+    // hecate (EXL3_NR4_PDLW): a programmatic dependent of o_proj: the constants (norm weight, score bias, the gate slice
+    // below) are requested before griddepcontrol.wait, the attention output and the residual after it
+    if (nw) { wa = load_w4<WBF16>(p.w, ea); if (!vb) wb = load_w4<WBF16>(p.w, eb); }
+#else
     if (nw)
     {
         ya = *(const float4*) (p.y + ro + ea); ra = *(const float4*) (p.r + ro + ea); wa = load_w4<WBF16>(p.w, ea);
         if (!vb) { yb = *(const float4*) (p.y + ro + eb); rb = *(const float4*) (p.r + ro + eb); wb = load_w4<WBF16>(p.w, eb); }
     }
+#endif
     float bz0 = 0.f, bz1 = 0.f;                                   // the leader's rows: score bias of its 2 experts per lane
     if (c == 0 && wid < M && p.bias) { bz0 = __ldg(p.bias + gi * EPC + lane); bz1 = __ldg(p.bias + gi * EPC + 32 + lane); }
 
@@ -159,6 +179,14 @@ __global__ void __launch_bounds__(NT, 1) nr4_kernel(const Params p)
         }
         asm volatile("cp.async.commit_group;" ::: "memory");
     }
+#ifdef NR4_PDLW
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    if (nw)
+    {
+        ya = *(const float4*) (p.y + ro + ea); ra = *(const float4*) (p.r + ro + ea);
+        if (!vb) { yb = *(const float4*) (p.y + ro + eb); rb = *(const float4*) (p.r + ro + eb); }
+    }
+#endif
 
     float4 sa = {}, sb = {};
     if (nw)
@@ -189,8 +217,9 @@ __global__ void __launch_bounds__(NT, 1) nr4_kernel(const Params p)
         for (int o = 16; o > 0; o /= 2) s += __shfl_xor_sync(0xffffffffu, s, o);
         const float rmf = rsqrtf(s / (float) DIM + p.eps) * p.cscale;
         const bool ho = gi == 0 && p.hy;
-        out4(sa, wa, p.cbias, rmf, gi == 0 ? p.x2 + ro + ea : nullptr, Xs + m * WST + ja * 128 + 4 * lane, ho ? p.hy + ro + ea : nullptr);
-        if (!vb) out4(sb, wb, p.cbias, rmf, gi == 0 ? p.x2 + ro + eb : nullptr, Xs + m * WST + 128 + 4 * lane, ho ? p.hy + ro + eb : nullptr);
+        half* const xf = gi == 0 && p.x2f ? p.x2f + ro : nullptr;
+        out4(sa, wa, p.cbias, rmf, gi == 0 ? p.x2 + ro + ea : nullptr, Xs + m * WST + ja * 128 + 4 * lane, ho ? p.hy + ro + ea : nullptr, xf, ea);
+        if (!vb) out4(sb, wb, p.cbias, rmf, gi == 0 ? p.x2 + ro + eb : nullptr, Xs + m * WST + 128 + 4 * lane, ho ? p.hy + ro + eb : nullptr, xf, eb);
     }
     asm volatile("cp.async.wait_group 0;" ::: "memory");
     __syncthreads();

@@ -1,7 +1,7 @@
 # Hecate: Hybrid Inference and Quantization for DGX Station (ExLlamaV3)
 
 Hecate serves **GLM-5.3 (753B MoE)** on a single **NVIDIA DGX Station GB300** at concurrency-1 decode speeds of
-**~173 tok/s** (stock model, MTP speculative decoding, 2 × 256K context). Its KL divergence to the BF16 model is lower
+**~181 tok/s** (stock model, MTP speculative decoding, 2 × 256K context). Its KL divergence to the BF16 model is lower
 than the published 3-bit EXL3 quant's.
 
 The model does not fit in any one memory of the machine. Hecate splits every MoE layer across all three processors at
@@ -21,11 +21,11 @@ release, [zai-org/GLM-5.3-BF16](https://huggingface.co/zai-org/GLM-5.3-BF16).
 
 | | Value |
 |---|---|
-| Decode, concurrency 1, 10 prompts × 3 passes, greedy, 400 tokens | **~173 tok/s** (stock; 170.7-175.9 in the release test passes) |
-| Decode vs context (llm-inference-bench, C=1, mean of 3 runs) | 16K: 154 · 32K: 143 · 64K: 153 · 128K: 145 tok/s |
-| One long prompt, then 300 tokens of decode (mean of 2 runs) | 27K: 4,645 tok/s prefill, 164 tok/s decode · 109K: 4,720 / 158 |
-| Prefill (llm-inference-bench standalone, cold) | ~4,850 tok/s at 8K-32K, 4,790 at 64K, 4,640 at 128K; time to first token 0.3 s at 1K |
-| KL divergence vs BF16 (rtx6kpro protocol, 36,848 positions) | **0.0738** (published EXL3 3.0 bpw: 0.1013) |
+| Decode, concurrency 1, 10 prompts × 3 passes, greedy, 400 tokens | **~181 tok/s** (stock; 179.5-182.8 in the release test passes) |
+| Decode vs context (llm-inference-bench, C=1, mean of 3 runs) | 16K: 144 · 32K: 156 · 64K: 148 · 128K: 146 tok/s |
+| One long prompt, then 300 tokens of decode (mean of 2 runs) | 27K: 4,648 tok/s prefill, 163 tok/s decode · 109K: 4,712 / 158 |
+| Prefill (llm-inference-bench standalone, cold) | ~4,800 tok/s at 8K-32K, 4,750 at 64K, 4,600 at 128K; time to first token 0.3 s at 1K |
+| KL divergence vs BF16 (rtx6kpro protocol, 36,848 positions) | **0.0735** (published EXL3 3.0 bpw: 0.1013) |
 | Context | 2 × 256K Q6 KV by default; a single 1M-token conversation with the long-context profile |
 
 ## Benchmarks
@@ -39,12 +39,12 @@ so the server samples at TabbyAPI's default of 1.0 (our own speed test is greedy
 
 | Context | C=1 | C=2 | C=4 | C=8 | C=16 | C=32 |
 |---|---:|---:|---:|---:|---:|---:|
-| 0 | 167 | 229 | 119 | 262 | 158 | 264 |
-| 4K | 159 | 198 | 121 | 267 | - | - |
-| 16K | 154 | 179 | 123 | 267 | - | - |
-| 32K | 143 | 183 | 121 | 262 | - | - |
-| 64K | 153 | 190 | 117 | - | - | - |
-| 128K | 145 | 174 | - | - | - | - |
+| 0 | 177 | 221 | 125 | 261 | 155 | 256 |
+| 4K | 161 | 170 | 124 | 271 | - | - |
+| 16K | 144 | 193 | 122 | 264 | - | - |
+| 32K | 156 | 191 | 122 | 267 | - | - |
+| 64K | 148 | 179 | 120 | - | - | - |
+| 128K | 146 | 169 | - | - | - | - |
 
 Each request gets the aggregate divided by C. Hecate is tuned for one or two conversations: from 4 concurrent requests
 it trims MTP drafts to stay on the 8-row decode fast path (4: one draft, 8: none), and from 16 it leaves that path.
@@ -54,8 +54,8 @@ Single C=1 cells vary by up to ±10% between runs, because MTP acceptance depend
 
 | Prompt | 1K | 4K | 8K | 16K | 32K | 64K | 128K |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Prefill tok/s | 3,362 | 3,908 | 4,805 | 4,870 | 4,860 | 4,788 | 4,638 |
-| Time to first token | 0.3 s | 1.1 s | 1.7 s | 3.3 s | 6.7 s | 13.5 s | 27.8 s |
+| Prefill tok/s | 3,380 | 3,870 | 4,768 | 4,836 | 4,810 | 4,750 | 4,602 |
+| Time to first token | 0.3 s | 1.1 s | 1.7 s | 3.4 s | 6.7 s | 13.6 s | 28.0 s |
 
 Prompts are processed in 8K-token chunks. Through release 1.2 every chunk paid a fixed ~1.7 s, because each picked expert was
 dequantized once per chunk (time to first token 2.0 s even at 1K tokens); the prefill MoE kernels removed that.
@@ -103,6 +103,10 @@ credits public work the change builds on; "—" means it came out of profiling t
 | Programmatic launch behind the small kernels | the combine-norm before each layer's q_a + kv_a GEMV and the q_a norm before q_b (4 CTAs each, the combine-norm spinning on the bands) launch their int8 GEMV as a programmatic dependent, which becomes resident and fills its weight ring while they run | +1.7% | programmatic dependent launch (CUDA) |
 | int8 GEMV cluster sizes | o_proj on 4-CTA clusters and the fused q_a + kv_a GEMV on 8 (the occupancy formula picked 3 and 7), measured per GEMV in a chain benchmark | +1.3% | — |
 | Grace band gather barrier | each of the 60 Grace threads arrives on its own cache line and thread 0 gathers them, then releases one sense flag (60 atomic increments on one line serialized ~3-4 µs per barrier, six barriers per job); bit-identical | +0.9% | per-thread-flag barriers (Mellor-Crummey and Scott) |
+| RTX band input staged by one kernel | each layer's RTX work began with a wait kernel and three copy-engine nodes that moved the layer's mailbox (rows, selection, weights) into VRAM: ~14 µs from the GB300's release to the first RTX kernel, mostly node transitions. One kernel now waits for the release and copies the mailbox (~5 µs). The RTX band finished after the GB300's hot band in 39% of layers, so its start latency was on the critical path | +2.3% | — |
+| Weight loads that skip L1 in the hot-tier MoE kernel | `moe4` streamed the expert weights through L1, evicting the activations (x in phase A, act in phase B) that every warp re-reads; the weight loads are now `ld.global.nc.L1::no_allocate`, and phase B prefetches its first units into L2 before it waits for act (weights and routing do not depend on it). Same arithmetic | +1.2% | — |
+| MoE combine launched behind the hot band | the combine-norm that ends each MoE layer launches as a programmatic dependent of `moe4`'s down phase: it becomes resident as that phase drains, waits for the RTX and Grace bands itself (the separate Grace wait kernel is gone), loads the bands' partials, the residual and the norm weight, and reads the hot band's sum only after the phase completes; the layer also stops zero-filling a routed sum nothing reads. Bit-identical | +0.9% | programmatic dependent launch (CUDA) |
+| Activations in MMA-fragment order | `moe4` multiplied every 2 KB weight unit by activations it gathered with eight 4-byte loads per lane; the norm + router kernel now also writes the MoE input, and the activation kernel writes act, in the m16n8k16 B-fragment layout, so each unit takes two 16-byte loads. Bit-identical | +0.8% | — |
 | Smaller wins | token embedding in HBM (removes a host sync per draft), int4 draft LM head, MTP layer in int4, fused shared-expert gate + up + SiLU, shared expert straight into the hot-tier accumulator | +1-3% each | int4 draft-only LM head: [b12x](https://github.com/local-inference-lab/b12x) |
 
 **Fidelity.** These changes made the model closer to BF16 than the published 3-bit quant, not just faster:
@@ -114,7 +118,7 @@ credits public work the change builds on; "—" means it came out of profiling t
 - the attention projections, shared experts, dense MLPs and LM head are int8 straight from BF16; the router, DSA
   indexer, kv_b_proj and the MTP eh_proj stay FP16.
 
-KLD is 0.0738 (release 1.5: 0.0742; paired difference -0.0004, 95% CI -0.0011 .. +0.0002), against 0.1013 for the
+KLD is 0.0735 (release 1.6: 0.0738; paired difference -0.0003, 95% CI -0.0007 .. +0.0002), against 0.1013 for the
 published EXL3 3.0 bpw on the same windows.
 
 ### KLD compared with other GLM-5.3 quants
@@ -130,7 +134,7 @@ group shares one exact window set.
 
 | Quant | bpw | KLD | Evaluation set |
 |---|---|---|---|
-| **Hecate** (this release) | 3.8² | **0.0738**¹ | ours: 18 windows, 36,848 positions (wiki, code, chat, math, zh, two 8K windows), verify-shape decode path |
+| **Hecate** (this release) | 3.8² | **0.0735**¹ | ours: 18 windows, 36,848 positions (wiki, code, chat, math, zh, two 8K windows), verify-shape decode path |
 | Infatoshi EXL3 3.0 bpw (scored by us) | 3.04 | 0.1013 | ours, same windows (against the BF16 of its own lineage) |
 | brandonmusic EXL3 TR3 | 3.0 | 0.0979 | 16 sealed windows, 32,752 positions |
 | vcruz305 EXL3 | 3.38 | 0.0948 | own set, 10,240 positions, 1,024-token sequences |

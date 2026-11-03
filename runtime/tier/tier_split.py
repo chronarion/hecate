@@ -47,9 +47,17 @@ HSIDE = os.environ.get("EXL3_TIER_HSIDE", "0") == "1"
 # EXL3_TIER_COMBINE_NORM=1: a decode MoE layer whose output goes to the next block's fused input norm leaves its combine
 # to that norm: cn.cu waits for the bands, adds the partials, updates the residual and normalizes in one kernel
 COMBINE_NORM = os.environ.get("EXL3_TIER_COMBINE_NORM", "0") == "1"
+# EXL3_CN_PDL=1 (with COMBINE_NORM): that kernel launches as a programmatic dependent of moe4 B (combine_norm_pdl): it
+# waits for the RTX DONE and the Grace CPU_DONE itself (no wait_reset_k), loads both partials, the residual and the norm
+# weight while B drains and reads the hot band only after griddepcontrol.wait; the layer skips the zero-filled routed
+# sum it never reads (BlockSparseMLP.tier_nofill). Bit-identical.
+CN_PDL = COMBINE_NORM and os.environ.get("EXL3_CN_PDL", "0") == "1"
 # EXL3_TIER_SH_MOE4=1: decode rows <= 8 run the shared expert inside moe4 (its int8 gate / up units in phase A's stream-K
 # list, act with weight 1, its down units in phase B) instead of the separate gate+up and down GEMVs before moe4
 SH_MOE4 = os.environ.get("EXL3_TIER_SH_MOE4", "0") == "1"
+# EXL3_MOE4_XF=1: the post-attention norm + router kernel (EXL3_NORM_ROUTE handoff) also writes the MoE input in moe4's
+# B-fragment order, and moe4 phase A reads that copy (two 16-byte loads per unit instead of eight 4-byte ones)
+MOE4_XF = os.environ.get("EXL3_MOE4_XF", "0") == "1"
 NPOS4 = int(os.environ.get("EXL3_TIER_P4_NPOS", "16384"))
 _VG = {"cap": False}   # set by exl3_vgraph while it captures a whole-forward graph (the RTX graph is launched outside)
 H_, I_ = 6144, 2048
@@ -130,11 +138,30 @@ def _cpu_partial(self, dev, bsz):
     return _CPU.out.data_ptr()
 
 
+def _cpu_wait_args(self, bsz):
+    """EXL3_CN_PDL: (partial address, CPU_DONE address, generation) of this layer's Grace job for combine_norm_pdl, which
+    waits for CPU_DONE >= generation and resets it itself; (0, 0, 0) if the layer has none"""
+    if not _far(self):
+        return 0, 0, 0
+    g = getattr(self, "_cpu_gen", None)
+    if g is None or bsz > 8:
+        return 0, 0, 0
+    self._cpu_gen = None
+    return _CPU.out.data_ptr(), _CPU.ctl_dev + 64, g
+
+
+def _tier_nofill(pend):
+    """EXL3_CN_PDL: the decode layers whose combine (tier_combine, "graph") never reads the routed sum before zeroing it"""
+    return isinstance(pend, tuple) and len(pend) == 2 and isinstance(pend[0], tuple) and pend[0][0] == "graph"
+
+
 class _HotShared:
     def __init__(self, dev):
         self.dev = torch.device(dev)
         self.scr = moe4.scratch(self.dev)
         self.y = torch.zeros(8, H_, dtype=torch.float, device=self.dev)   # hot-band accumulator (decode rows)
+        self.cctr = torch.zeros(1, dtype=torch.int32, device=self.dev)    # combine_norm_pdl's CTA counter (EXL3_CN_PDL)
+        self.xf = torch.zeros(8, H_, dtype=torch.half, device=self.dev)   # the decode MoE input in fragment order (EXL3_MOE4_XF)
         sms = torch.cuda.get_device_properties(self.dev).multi_processor_count
         self.blocks, self.blocks_a = sms * 2, sms * 3
         self.h_stream = torch.cuda.Stream(self.dev) if HSIDE else None
@@ -223,6 +250,8 @@ def tier_split_load(self, device, **kwargs):
     self.cpu_split_submit = types.MethodType(tier_submit, self)
     self.nr_handoff = types.MethodType(tier_nr_handoff, self)     # (EXL3_NORM_ROUTE)
     self.cpu_split_combine = types.MethodType(tier_combine, self)
+    if CN_PDL:
+        self.tier_nofill = _tier_nofill
     if SH_FAST and getattr(self, "shared_experts", None) is not None:
         _mf = self.forward
         def _fwd(x, params, out_dtype=None, _m=self, _f=_mf):
@@ -459,7 +488,8 @@ def tier_nr_handoff(self, bsz):
     meta, lay, f2, g2 = cpu if cpu is not None else (0, 0, 0, 0)
     v = rg.slot_view(self)
     self._nr_handed = bsz
-    return (v["y"].data_ptr(), v["s"].data_ptr(), v["w"].data_ptr(), v["issue"], 1, meta, lay, f2, g2, v["done"])
+    ho = (v["y"].data_ptr(), v["s"].data_ptr(), v["w"].data_ptr(), v["issue"], 1, meta, lay, f2, g2, v["done"])
+    return ho + (_T.xf.data_ptr(),) if MOE4_XF else ho
 
 
 def _sh_i8(sh):
@@ -489,6 +519,7 @@ _SH_SAID = False
 
 def tier_submit(self, y, bsz, selected_experts, routing_weights):
     L = self._L
+    xf = False
     if not _CPU.started and _far(self):
         _cpu_start()                                  # before the first handoff of any size (the combine waits CPU_DONE)
     if self._nortx:
@@ -496,6 +527,7 @@ def tier_submit(self, y, bsz, selected_experts, routing_weights):
     elif bsz <= 8 and getattr(self, "_nr_handed", 0) == bsz:
         self._nr_handed = 0                           # the post-attention norm + router kernel did the handoff
         pend = ("graph", 0, bsz)
+        xf = MOE4_XF                                  # ... and wrote the fragment-order input (EXL3_MOE4_XF)
     elif bsz <= 8:
         cpu = _pre_handoff(self, bsz)
         if HSIDE:
@@ -526,9 +558,14 @@ def tier_submit(self, y, bsz, selected_experts, routing_weights):
             if not shp:
                 sh.bc.run_bszN(y.view(1, bsz, -1), yh.view(1, bsz, -1))   # shared expert into the accumulator (overwrite)
             self.shared_experts = None                # restored by the forward wrapper
-        moe4.forward(y, selected_experts.view(bsz, -1).contiguous(), routing_weights.view(bsz, -1).contiguous(),
-                     Hh.hot if Hh.far else Hh.n, Hh.tab["gate_w"], Hh.tab["up_w"], Hh.tab["down_w"],
-                     Hh.tab["gate_s"], Hh.tab["up_s"], Hh.tab["down_s"], *T.scr, yh, T.blocks, T.blocks_a, 0, *shp)
+        if xf:
+            moe4.forward(T.xf[:bsz], selected_experts.view(bsz, -1).contiguous(), routing_weights.view(bsz, -1).contiguous(),
+                         Hh.hot if Hh.far else Hh.n, Hh.tab["gate_w"], Hh.tab["up_w"], Hh.tab["down_w"],
+                         Hh.tab["gate_s"], Hh.tab["up_s"], Hh.tab["down_s"], *T.scr, yh, T.blocks, T.blocks_a, 0, *shp, xf=1)
+        else:
+            moe4.forward(y, selected_experts.view(bsz, -1).contiguous(), routing_weights.view(bsz, -1).contiguous(),
+                         Hh.hot if Hh.far else Hh.n, Hh.tab["gate_w"], Hh.tab["up_w"], Hh.tab["down_w"],
+                         Hh.tab["gate_s"], Hh.tab["up_s"], Hh.tab["down_s"], *T.scr, yh, T.blocks, T.blocks_a, 0, *shp)
         hot = ("main", bsz)
     elif pend[0] == "gb300":
         hot = ("pre", _prefill_gb300(self, y, selected_experts.view(bsz, -1), routing_weights.view(bsz, -1)))
@@ -558,10 +595,29 @@ def tier_combine(self, final_hidden_states, cpu_partial, cpu_pending, shape):
             torch.cuda.current_stream(dev).wait_stream(_T.h_stream)
             self._h_join = None
         o_ptr, done = rg.wait_done(self, dev)
-        o2 = _cpu_partial(self, dev, rows)
         prm = getattr(self, "_prm", None)
         if prm is not None and prm.get("mlp_defer_ok") and f2.dtype == torch.float and f2.is_contiguous() and \
                 self.latent_out is None and not self.routed_post_norm and not self.tp_reduce and self.shared_experts is None:
+            if CN_PDL:     # f2 is not zero-filled (tier_nofill): the fused kernel ignores it, the fallback zeroes it
+                cw = _cpu_wait_args(self, rows)
+                def can(norm, x, _r=rows):
+                    w = getattr(norm, "weight", None)
+                    return (w is not None and getattr(norm, "groups", 1) == 1 and not getattr(norm, "span_heads", False) and
+                            w.numel() == H_ and w.dtype in (torch.half, torch.bfloat16) and w.is_contiguous() and
+                            x.dtype == torch.float and x.is_contiguous() and x.numel() == _r * H_)
+                def run(_f=f2, _o=o_ptr, _r=rows, _cw=cw, _d=done, _dev=dev):
+                    if _cw[1]:
+                        rg._fk.wait_reset(_cw[1], _cw[2], 0, _dev.index if _dev.index is not None else 0)
+                    _f.zero_()
+                    moe4.combine(_f, _o, _T.y, _r, _cw[0], _d)
+                def fused(x, norm, _o=o_ptr, _r=rows, _cw=cw, _d=done):
+                    xn = torch.empty((_r, H_), dtype=torch.half, device=x.device)
+                    cn.combine_norm_pdl(0, _o, _T.y, _r, _cw[0], _d, _cw[1], _cw[2], _T.cctr, x.view(_r, H_), norm.weight.data,
+                                        xn, float(norm.rms_norm_eps), float(norm.constant_bias), float(norm.constant_scale), 1)
+                    return xn.view(x.shape)
+                prm["resid_pending_combine"] = (can, run, fused)
+                return final_hidden_states
+            o2 = _cpu_partial(self, dev, rows)
             # EXL3_TIER_COMBINE_NORM: the next block's input norm runs this combine (runtime/patched/transformer.py)
             def can(norm, x, _r=rows):
                 w = getattr(norm, "weight", None)
@@ -577,6 +633,9 @@ def tier_combine(self, final_hidden_states, cpu_partial, cpu_pending, shape):
                 return xn.view(x.shape)
             prm["resid_pending_combine"] = (can, run, fused)
             return final_hidden_states
+        o2 = _cpu_partial(self, dev, rows)
+        if CN_PDL:
+            f2.zero_()
         moe4.combine(f2, o_ptr, _T.y, rows, o2, done)
         return final_hidden_states
     final_hidden_states = rs.rtx_combine(self, final_hidden_states, cpu_partial, pend, shape)

@@ -62,8 +62,9 @@ RUN python3 /tmp/p/kvq/apply_kvq.py ${EXT} /tmp/p/kvq
 RUN python3 /tmp/p/norm/apply_norm2.py ${EXT}
 # hecate (EXL3_NORM_PDL): rms_norm_kernel as a programmatic dependent (waits for x, lets the next GEMV launch early)
 RUN python3 /tmp/p/norm/apply_normpdl.py ${EXT}
-# 10. the decode MoE combine fused into the next block's input norm (EXL3_TIER_COMBINE_NORM, runtime/tier/cn.cu)
-RUN python3 /tmp/p/cn/apply_cn.py ${SP}
+# 10. the decode MoE combine fused into the next block's input norm (EXL3_TIER_COMBINE_NORM, runtime/tier/cn.cu); with
+#     EXL3_CN_PDL the tier's MoE layers skip the zero-filled routed sum that combine_norm_pdl never reads
+RUN python3 /tmp/p/cn/apply_cn.py ${SP} && python3 /tmp/p/cn/apply_cnfill.py ${SP}
 # 11. multi-block radix select for the DSA indexer top-k of few-row selections (decode) and prefill slabs
 #     (EXL3_DSA_TOPK_RADIX)
 RUN python3 /tmp/p/topk/apply_topk_radix.py ${EXT} /tmp/p/topk
@@ -103,7 +104,8 @@ ENV EXL3_MOE4_SRC=/opt/hecate/tier/moe4 EXL3_TIER_BUILD=/root/.cache/hecate-tier
     EXL3_DSA_TOPK_SPLIT=0 EXL3_MLA_SPLIT_TPS=2 EXL3_MLA_SPLIT_TILES=1 EXL3_MLA_COMBINE_DSPLIT=16 EXL3_COMBINE_CFG=8,1 \
     EXL3_MLA_BLOCK_H_Q=4 EXL3_DSA_SCORE_TILE=262144 EXL3_HIDX=1 EXL3_DSA_TOPK_RADIX=16384 \
     EXL3_NORM_ROUTE=1 EXL3_NORM_ROUTE_HANDOFF=1 EXL3_WARMUP=1 \
-    EXL3_I8_CL_CS_LK=4 EXL3_I8_CL_CS_DUAL=8 EXL3_I8_PDL=1 EXL3_NORM_PDL=1 EXL3_TIER_SH_MOE4=1
+    EXL3_I8_CL_CS_LK=4 EXL3_I8_CL_CS_DUAL=8 EXL3_I8_PDL=1 EXL3_NORM_PDL=1 EXL3_TIER_SH_MOE4=1 \
+    EXL3_CN_PDL=1 EXL3_MOE4_XF=1 EXL3_RTX_STAGE1=1
 RUN find ${SP} -name __pycache__ -prune -exec rm -rf {} +
 WORKDIR /opt/tabbyAPI
 EXPOSE 8103

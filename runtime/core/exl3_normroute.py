@@ -40,20 +40,26 @@ void norm_route(at::Tensor y, at::Tensor r, at::Tensor w, at::Tensor x2, at::Ten
     Params p{(const float*) y.data_ptr(), (float*) r.data_ptr(), w.data_ptr(), (half*) x2.data_ptr(), (const half*) gt.data_ptr(),
              bias.has_value() ? (const float*) bias->data_ptr() : nullptr, (int64_t*) sel.data_ptr(), (half*) rw.data_ptr(),
              (int4*) cand.data_ptr(), (int*) ctr.data_ptr(), M, (float) eps, (float) cbias, (float) cscale, (float) scale,
-             nullptr, nullptr, nullptr, nullptr, 0u, nullptr, 0u, nullptr, 0u, nullptr};
-    if (ho.size() == 10)      // handoff slot (y, sel, rw), ISSUE flag + gen, Grace header + layer, Grace flag + gen, RTX DONE
-    {
+             nullptr, nullptr, nullptr, nullptr, 0u, nullptr, 0u, nullptr, 0u, nullptr, nullptr};
+    if (ho.size() == 10 || ho.size() == 11)   // handoff slot (y, sel, rw), ISSUE flag + gen, Grace header + layer, Grace
+    {                                         // flag + gen, RTX DONE (+ moe4's fragment-order x, EXL3_MOE4_XF)
         p.hy = (half*) ho[0]; p.hs = (int64_t*) ho[1]; p.hw = (half*) ho[2]; p.hflag = (unsigned*) ho[3]; p.hgen = (unsigned) ho[4];
         p.hmeta = (unsigned*) ho[5]; p.hm0 = (unsigned) ho[6]; p.hflag2 = (unsigned*) ho[7]; p.hgen2 = (unsigned) ho[8];
         p.hzero = (unsigned*) ho[9];
         if (!ho[5]) p.hmeta = nullptr;
         if (!ho[7]) p.hflag2 = nullptr;
         if (!ho[9]) p.hzero = nullptr;
+        if (ho.size() == 11) p.x2f = (half*) ho[10];
     }
-    cudaLaunchConfig_t cfg = {}; cudaLaunchAttribute at[1];
+    cudaLaunchConfig_t cfg = {}; cudaLaunchAttribute at[2];
     at[0].id = cudaLaunchAttributeClusterDimension; at[0].val.clusterDim.x = CS; at[0].val.clusterDim.y = 1; at[0].val.clusterDim.z = 1;
+    at[1].id = cudaLaunchAttributeProgrammaticStreamSerialization; at[1].val.programmaticStreamSerializationAllowed = 1;
     cfg.gridDim = dim3(CS * G); cfg.blockDim = dim3(NT); cfg.dynamicSmemBytes = SMEM;
+#ifdef NR4_PDLW
+    cfg.stream = at::cuda::getCurrentCUDAStream().stream(); cfg.attrs = at; cfg.numAttrs = 2;   // EXL3_NR4_PDLW
+#else
     cfg.stream = at::cuda::getCurrentCUDAStream().stream(); cfg.attrs = at; cfg.numAttrs = 1;
+#endif
     if (wbf) C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, nr4_kernel<true>, p));
     else C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, nr4_kernel<false>, p));
 }
@@ -72,11 +78,13 @@ def _ext_mod():
     if _ext is None:
         from torch.utils.cpp_extension import load_inline
         bd = os.path.join(os.environ.get("EXL3_TIER_BUILD", "/tmp"), "build_normroute"); os.makedirs(bd, exist_ok=True)
-        _ext = load_inline(name="exl3_normroute4", cpp_sources=_DECL, cuda_sources=_HOST,
+        _pw = os.environ.get("EXL3_NR4_PDLW", "0") == "1"
+        _ext = load_inline(name="exl3_normroute4f" + ("w" if _pw else ""), cpp_sources=_DECL, cuda_sources=_HOST,
                            functions=["norm_route"], build_directory=bd,
                            extra_include_paths=[_DIR],
                            extra_cuda_cflags=["-O3", "--use_fast_math", "-gencode=arch=compute_103a,code=sm_103a"]
-                           + (["-DNR4_PDL"] if os.environ.get("EXL3_I8_PDL", "0") == "1" else []))
+                           + (["-DNR4_PDL"] if os.environ.get("EXL3_I8_PDL", "0") == "1" else [])
+                           + (["-DNR4_PDLW"] if _pw else []))
     return _ext
 
 

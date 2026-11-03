@@ -67,6 +67,11 @@ def _dbg_sync(tag, device):
 
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import gdc_launch_dependents as _gdc_launch
+# hecate (EXL3_UNFOLD_PDL=1): the unfold kernel lets o_proj (an int8 GEMV launched as a programmatic dependent) become
+# resident at once and fill its weight ring while the unfold runs; o_proj reads the unfold's output only after its
+# griddepcontrol.wait. No other Triton kernel changes (all-kernel PDL lost 3.4%)
+UNFOLD_PDL = tl.constexpr(1 if os.environ.get("EXL3_UNFOLD_PDL", "0") == "1" else 0)
 
 from .triton_paged import _qc_load_kt, _qc_load_v, _rot_h32
 
@@ -693,6 +698,8 @@ def _mla_unfold_kernel(
     """Per-head unfold o_h = o_lat_h @ W_UV_h from the flat layout, emitting token-major
     output so o_proj consumes it without a permute. hecate: BLOCK_V < D_v splits each head's
     output columns over D_v / BLOCK_V programs along grid dim 0 (64 heads alone fill 64 SMs)."""
+    if UNFOLD_PDL:
+        _gdc_launch()
     BV: tl.constexpr = BLOCK_V if BLOCK_V > 0 else D_v
     NV: tl.constexpr = D_v // BV
     pid_m = tl.program_id(0) // NV
