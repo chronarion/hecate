@@ -1,7 +1,7 @@
 # Hecate: Hybrid Inference and Quantization for DGX Station (ExLlamaV3)
 
 Hecate serves **GLM-5.3 (753B MoE)** on a single **NVIDIA DGX Station GB300** at concurrency-1 decode speeds of
-**~148 tok/s** (stock model, MTP speculative decoding, 2 × 256K context). Its KL divergence to the BF16 model is lower
+**~165 tok/s** (stock model, MTP speculative decoding, 2 × 256K context). Its KL divergence to the BF16 model is lower
 than the published 3-bit EXL3 quant's.
 
 The model does not fit in any one memory of the machine. Hecate splits every MoE layer across all three processors at
@@ -21,11 +21,11 @@ release, [zai-org/GLM-5.3-BF16](https://huggingface.co/zai-org/GLM-5.3-BF16).
 
 | | Value |
 |---|---|
-| Decode, concurrency 1, 10 prompts × 3 passes, greedy, 400 tokens | **~162 tok/s** (stock; 159-164 across the release test passes) |
-| Decode vs context (llm-inference-bench, C=1, mean of 3 runs) | 16K: 148 · 32K: 140 · 64K: 143 · 128K: 143 tok/s |
-| One long prompt, then 300 tokens of decode (mean of 3 runs) | 27K: 4,540 tok/s prefill, 154 tok/s decode · 109K: 4,160 / 143 |
-| Prefill (llm-inference-bench standalone, cold) | ~4,800 tok/s at 8K-32K, 4,460 at 64K, 3,980 at 128K; time to first token 0.3 s at 1K |
-| KL divergence vs BF16 (rtx6kpro protocol, 36,848 positions) | **0.0741** (published EXL3 3.0 bpw: 0.1013) |
+| Decode, concurrency 1, 10 prompts × 3 passes, greedy, 400 tokens | **~165 tok/s** (stock; 161.6-168.0 in the release test passes) |
+| Decode vs context (llm-inference-bench, C=1, mean of 3 runs) | 16K: 147 · 32K: 143 · 64K: 149 · 128K: 145 tok/s |
+| One long prompt, then 300 tokens of decode (mean of 2 runs) | 27K: 4,740 tok/s prefill, 164 tok/s decode · 109K: 4,740 / 143 |
+| Prefill (llm-inference-bench standalone, cold) | ~4,850 tok/s at 8K-32K, 4,800 at 64K, 4,615 at 128K; time to first token 0.3 s at 1K |
+| KL divergence vs BF16 (rtx6kpro protocol, 36,848 positions) | **0.0742** (published EXL3 3.0 bpw: 0.1013) |
 | Context | 2 × 256K Q6 KV by default; a single 1M-token conversation with the long-context profile |
 
 ## Benchmarks
@@ -39,12 +39,12 @@ so the server samples at TabbyAPI's default of 1.0 (our own speed test is greedy
 
 | Context | C=1 | C=2 | C=4 | C=8 | C=16 | C=32 |
 |---|---:|---:|---:|---:|---:|---:|
-| 0 | 156 | 186 | 117 | 247 | 153 | 253 |
-| 4K | 169 | 166 | 115 | 250 | - | - |
-| 16K | 148 | 181 | 113 | 245 | - | - |
-| 32K | 140 | 173 | 114 | 246 | - | - |
-| 64K | 143 | 176 | 109 | - | - | - |
-| 128K | 143 | 165 | - | - | - | - |
+| 0 | 163 | 200 | 118 | 252 | 167 | 278 |
+| 4K | 144 | 185 | 118 | 262 | - | - |
+| 16K | 147 | 164 | 116 | 263 | - | - |
+| 32K | 143 | 172 | 120 | 258 | - | - |
+| 64K | 149 | 179 | 117 | - | - | - |
+| 128K | 145 | 166 | - | - | - | - |
 
 Each request gets the aggregate divided by C. Hecate is tuned for one or two conversations: from 4 concurrent requests
 it trims MTP drafts to stay on the 8-row decode fast path (4: one draft, 8: none), and from 16 it leaves that path.
@@ -54,8 +54,8 @@ Single C=1 cells vary by up to ±10% between runs, because MTP acceptance depend
 
 | Prompt | 1K | 4K | 8K | 16K | 32K | 64K | 128K |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Prefill tok/s | 3,348 | 3,881 | 4,779 | 4,862 | 4,820 | 4,456 | 3,977 |
-| Time to first token | 0.3 s | 1.1 s | 1.7 s | 3.3 s | 6.7 s | 14.5 s | 32.4 s |
+| Prefill tok/s | 3,386 | 3,914 | 4,768 | 4,878 | 4,863 | 4,802 | 4,615 |
+| Time to first token | 0.3 s | 1.1 s | 1.7 s | 3.3 s | 6.6 s | 13.4 s | 27.9 s |
 
 Prompts are processed in 8K-token chunks. Through release 1.2 every chunk paid a fixed ~1.7 s, because each picked expert was
 dequantized once per chunk (time to first token 2.0 s even at 1K tokens); the prefill MoE kernels removed that.
@@ -92,9 +92,13 @@ credits public work the change builds on; "—" means it came out of profiling t
 | Grace band barrier | the 60 Grace threads synchronized on a barrier whose counter and sense flag shared one cache line, so every arrival fought the spinning threads for it; on separate 128-byte lines (bit-identical results) | +3.0% | false sharing |
 | Router tail | the fused router's top-8 rounds are two warp reductions over order-preserving keys (same selections), its completion counter one acquire-release atomic | +2.0% | — |
 | MoE handoff on a side stream | the kernel that copies each MoE layer's input and routing into the RTX / Grace mailboxes runs on a second stream (one 256-thread block); the GB300's shared and hot experts start without it | +1.6% | — |
+| Post-attention norm + router + band handoff in one kernel | between o_proj and the MoE, each decode layer ran the post-attention RMSNorm (one block per row), the fused router (128 blocks, fp32 atomics, a counter, the last block's top-8) and the handoff kernel. One kernel of 4 thread-block clusters x 16 CTAs now does all three: each CTA owns the column sets of two of the norm kernel's warps (bit-identical residual and MoE input), stages its cluster's 64-expert gate slice while the norm runs, computes partial logits on tensor cores and sums them through distributed shared memory; the clusters' top-8 candidates are merged by the last cluster leader (the same selections), which also writes the band slot and releases ISSUE | 13.8 → 10.6 µs per layer between o_proj and the MoE, and the bands start ~3 µs earlier: decode +3.7% (159.6 → 165.4 tok/s), +4.4% at 44K | — |
 | MoE combine fused into the next norm, register-path RMSNorm | a decode MoE layer leaves its final combine to the next block's input norm (one kernel waits for the bands, adds the partials, updates the residual, normalizes); the 6144-wide norms keep each thread's two float4 columns in registers with all loads first. Bit-identical | +1.9% | — |
 | Sparse attention fixed costs (`hmla`) | first tiles' gathers issued before the query staging (which the idle softmax warps help with); all eight load warps build every tile, two tiles of gathered words in flight; fp32 partials out through shared memory as whole 128-byte rows from twelve warps; a 16-way merge with every load up front, launched as a programmatic dependent. Bit-identical | decode attention 23.7 → 17.2 µs per call (+1-2% decode at 23K-64K); prefill attention -7.6% | programmatic dependent launch (CUDA) |
 | Prefill MoE CTA order (`moe4t`) | expert-major CTA order: a row block's inputs stay in L2 across its 16-48 channel tiles (they were re-read from HBM once per tile, ~9 GB per GEMM per 8K chunk) and each weight tile is read once per expert; the down GEMM adds its scaled sums into the output itself | int4 prefill MoE 4.8 → 3.8 ms per 8K chunk | — |
+| One indexer score tile per prompt slab | ExLlamaV3 scored each 256-row prompt slab against the visible keys in 32K-key tiles and merged the tiles' top-2,048 with torch.topk (a gather, two concatenations and a sort per tile); a slab now scores up to 256K keys in one call and runs one top-k over the row (the merge was exact: the same selections) | DSA indexer per 8K chunk at 64K / 128K of context: 23 / 43 → 8 / 15 ms per layer; time to first token at 112K 26.9 → 24.1 s | — |
+| tcgen05 indexer scoring for prefill (`hidx`) | the lightning indexer's weighted sum of 32 heads of `relu(q·k)` as one UMMA chain per 128-key tile, `D[keys][8 queries × 32 heads] = K · Qᵀ` in tensor memory (two accumulators, so one tile's epilogue overlaps the next tile's MMAs), the head reduction in the epilogue in the Triton kernel's order; keys through a TMA ring, paged pools through the block table | bit-identical scores at 2× the Triton kernel (645 → 1,300-1,600 TFLOPS); time to first token at 112K 24.1 → 23.6 s | — |
+| Radix-select DSA top-k for decode | the indexer's top-2,048 per verify row ran on one 1,024-thread block per row (three sweeps of up to 128K scores on 4 of 152 SMs); rows are now cut into 4,096-key slices across CTAs: high-byte histograms, the threshold bucket and low-byte histograms, then ordered compaction from per-slice counts; rows of up to 12K keys stay in one CTA | identical selections; 72.9 → 12.4 µs per indexer layer at 128K of context; decode at 112K +4% (141 → 147 tok/s) | radix select (GPU top-k) |
 | Smaller wins | token embedding in HBM (removes a host sync per draft), int4 draft LM head, MTP layer in int4, fused shared-expert gate + up + SiLU, shared expert straight into the hot-tier accumulator | +1-3% each | int4 draft-only LM head: [b12x](https://github.com/local-inference-lab/b12x) |
 
 **Fidelity.** These changes made the model closer to BF16 than the published 3-bit quant, not just faster:
@@ -106,7 +110,7 @@ credits public work the change builds on; "—" means it came out of profiling t
 - the attention projections, shared experts, dense MLPs and LM head are int8 straight from BF16; the router, DSA
   indexer, kv_b_proj and the MTP eh_proj stay FP16.
 
-KLD is 0.0741 (release 1.3: 0.0738; paired difference +0.0003, 95% CI -0.0002 .. +0.0009), against 0.1013 for the
+KLD is 0.0742 (release 1.4: 0.0741; paired difference +0.0002, 95% CI -0.0009 .. +0.0012), against 0.1013 for the
 published EXL3 3.0 bpw on the same windows.
 
 ### KLD compared with other GLM-5.3 quants
@@ -122,7 +126,7 @@ group shares one exact window set.
 
 | Quant | bpw | KLD | Evaluation set |
 |---|---|---|---|
-| **Hecate** (this release) | 3.8² | **0.0741**¹ | ours: 18 windows, 36,848 positions (wiki, code, chat, math, zh, two 8K windows), verify-shape decode path |
+| **Hecate** (this release) | 3.8² | **0.0742**¹ | ours: 18 windows, 36,848 positions (wiki, code, chat, math, zh, two 8K windows), verify-shape decode path |
 | Infatoshi EXL3 3.0 bpw (scored by us) | 3.04 | 0.1013 | ours, same windows (against the BF16 of its own lineage) |
 | brandonmusic EXL3 TR3 | 3.0 | 0.0979 | 16 sealed windows, 32,752 positions |
 | vcruz305 EXL3 | 3.38 | 0.0948 | own set, 10,240 positions, 1,024-token sequences |

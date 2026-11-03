@@ -26,14 +26,14 @@ engine-specific probes and Prometheus diagnostics are disabled. Using
 OpenAI-stream-only measurement.
 Model context length: 262,144 tokens
 Prefill tests: standalone cold profile ['64k']
-Calibrating padding text (run=xcpqhrszsxqj, up to 128k)...
+Calibrating padding text (run=ezxmredlmvxg, up to 128k)...
   Token targeting: single-point estimate from 8k (use --token-targeting exact 
 for /tokenize binary search)
   Calibrated: 6.18 chars/token (from 8k probe)
-  16k: 101,176 chars (~16,383 tokens)
-  32k: 202,352 chars (~32,767 tokens)
-  64k: 404,705 chars (~65,535 tokens)
-  128k: 809,411 chars (~131,071 tokens)
+  16k: 101,196 chars (~16,383 tokens)
+  32k: 202,393 chars (~32,767 tokens)
+  64k: 404,786 chars (~65,535 tokens)
+  128k: 809,572 chars (~131,071 tokens)
 Done.
 
 
@@ -44,7 +44,7 @@ Prefill Speed (C=1, client ISL / TTFT)
                                                                 PCIe rx/tx      
   Context   Tokens   TTFT (s)   Client tok/s   Server tok/s            avg   N  
  ────────────────────────────────────────────────────────────────────────────── 
-  64k       64,494      14.40          4,479              —              —   1  
+  64k       64,511      13.47          4,788              —              —   1  
                                                                                 
 Client tok/s = prompt_tokens / TTFT. Integrated scout rows come from the 
 prefix-cache scout request that decode needs anyway. Server tok/s is optional 

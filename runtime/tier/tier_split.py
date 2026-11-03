@@ -218,6 +218,7 @@ def tier_split_load(self, device, **kwargs):
     if not nortx:
         rg.MODS.append(self)
     self.cpu_split_submit = types.MethodType(tier_submit, self)
+    self.nr_handoff = types.MethodType(tier_nr_handoff, self)     # (EXL3_NORM_ROUTE)
     self.cpu_split_combine = types.MethodType(tier_combine, self)
     if SH_FAST and getattr(self, "shared_experts", None) is not None:
         _mf = self.forward
@@ -429,22 +430,46 @@ def _prefill_gb300(self, y, sel, rw):
     return out
 
 
+def _pre_handoff(self, bsz):
+    """decode handoff bookkeeping: the step's RTX graph on the first tier layer, this layer's Grace job generation;
+    returns the Grace job (meta, layer, flag, gen) or None"""
+    L = self._L
+    if self is rg.MODS[0] and not _VG["cap"]:         # (a captured verify graph launches it before each replay)
+        rg.launch(bsz)                                # the whole step's RTX band (waits on each layer's ISSUE)
+    if not _far(self):
+        return None
+    if _VG["cap"]:                                    # reserved range in captured graphs: never equal to an eager job
+        self._cpu_gen = 0x40000000 | L
+    else:
+        _CPU.gen += 1; self._cpu_gen = _CPU.gen
+    return (_CPU.ctl_dev + 128, L, _CPU.ctl_dev, self._cpu_gen)
+
+
+def tier_nr_handoff(self, bsz):
+    """EXL3_NORM_ROUTE: the slot pointers and flags of this layer's decode handoff, for the post-attention norm +
+    router kernel to write and release itself (tier_submit then skips its handoff); None if this layer has none"""
+    if self._nortx or bsz > 8 or not hasattr(self, "_gslot"):
+        return None
+    if not _CPU.started and _far(self):
+        _cpu_start()
+    cpu = _pre_handoff(self, bsz)
+    meta, lay, f2, g2 = cpu if cpu is not None else (0, 0, 0, 0)
+    v = rg.slot_view(self)
+    self._nr_handed = bsz
+    return (v["y"].data_ptr(), v["s"].data_ptr(), v["w"].data_ptr(), v["issue"], 1, meta, lay, f2, g2, v["done"])
+
+
 def tier_submit(self, y, bsz, selected_experts, routing_weights):
     L = self._L
     if not _CPU.started and _far(self):
         _cpu_start()                                  # before the first handoff of any size (the combine waits CPU_DONE)
     if self._nortx:
         pend = ("nortx", 0, bsz)
+    elif bsz <= 8 and getattr(self, "_nr_handed", 0) == bsz:
+        self._nr_handed = 0                           # the post-attention norm + router kernel did the handoff
+        pend = ("graph", 0, bsz)
     elif bsz <= 8:
-        if self is rg.MODS[0] and not _VG["cap"]:     # (a captured verify graph launches it before each replay)
-            rg.launch(bsz)                            # the whole step's RTX band (waits on each layer's ISSUE)
-        cpu = None
-        if _far(self):
-            if _VG["cap"]:                            # reserved range in captured graphs: never equal to an eager job
-                self._cpu_gen = 0x40000000 | L
-            else:
-                _CPU.gen += 1; self._cpu_gen = _CPU.gen
-            cpu = (_CPU.ctl_dev + 128, L, _CPU.ctl_dev, self._cpu_gen)
+        cpu = _pre_handoff(self, bsz)
         if HSIDE:
             hs = _T.h_stream
             hy, hsel, hrw = y.contiguous(), selected_experts.contiguous(), routing_weights.contiguous()

@@ -4,7 +4,7 @@
     "engine": "openai_proxy",
     "model": "base",
     "server": "127.0.0.1:8103",
-    "timestamp": "2026-11-02T21:46:16.626060",
+    "timestamp": "2026-11-03T05:53:13.294553",
     "decode_mode": "duration",
     "primary_decode_layer": "sustained_decode",
     "duration_per_test": 30.0,
@@ -185,12 +185,12 @@
   "event_log": [],
   "prefill": {
     "1024": {
-      "ttft_seconds": 0.345,
-      "prefill_seconds": 0.345,
-      "tok_per_sec": 3349.0,
-      "client_ttft_seconds": 0.345,
-      "client_tok_per_sec": 3349.0,
-      "prompt_tokens": 1154,
+      "ttft_seconds": 0.341,
+      "prefill_seconds": 0.341,
+      "tok_per_sec": 3384.0,
+      "client_ttft_seconds": 0.341,
+      "client_tok_per_sec": 3384.0,
+      "prompt_tokens": 1155,
       "samples": 20,
       "method": "client",
       "server_validation": {
@@ -207,12 +207,12 @@
       "hardware_summary": {}
     },
     "4096": {
-      "ttft_seconds": 1.073,
-      "prefill_seconds": 1.073,
-      "tok_per_sec": 3885.0,
-      "client_ttft_seconds": 1.073,
-      "client_tok_per_sec": 3885.0,
-      "prompt_tokens": 4169,
+      "ttft_seconds": 1.066,
+      "prefill_seconds": 1.066,
+      "tok_per_sec": 3911.0,
+      "client_ttft_seconds": 1.066,
+      "client_tok_per_sec": 3911.0,
+      "prompt_tokens": 4170,
       "samples": 7,
       "method": "client",
       "server_validation": {
@@ -229,11 +229,11 @@
       "hardware_summary": {}
     },
     "8192": {
-      "ttft_seconds": 1.713,
-      "prefill_seconds": 1.713,
-      "tok_per_sec": 4788.0,
-      "client_ttft_seconds": 1.713,
-      "client_tok_per_sec": 4788.0,
+      "ttft_seconds": 1.704,
+      "prefill_seconds": 1.704,
+      "tok_per_sec": 4811.0,
+      "client_ttft_seconds": 1.704,
+      "client_tok_per_sec": 4811.0,
       "prompt_tokens": 8200,
       "samples": 5,
       "method": "client",
@@ -251,12 +251,12 @@
       "hardware_summary": {}
     },
     "16384": {
-      "ttft_seconds": 3.332,
-      "prefill_seconds": 3.332,
-      "tok_per_sec": 4871.0,
-      "client_ttft_seconds": 3.332,
-      "client_tok_per_sec": 4871.0,
-      "prompt_tokens": 16229,
+      "ttft_seconds": 3.321,
+      "prefill_seconds": 3.321,
+      "tok_per_sec": 4886.0,
+      "client_ttft_seconds": 3.321,
+      "client_tok_per_sec": 4886.0,
+      "prompt_tokens": 16227,
       "samples": 3,
       "method": "client",
       "server_validation": {
@@ -273,12 +273,12 @@
       "hardware_summary": {}
     },
     "32768": {
-      "ttft_seconds": 6.692,
-      "prefill_seconds": 6.692,
-      "tok_per_sec": 4830.0,
-      "client_ttft_seconds": 6.692,
-      "client_tok_per_sec": 4830.0,
-      "prompt_tokens": 32322,
+      "ttft_seconds": 6.633,
+      "prefill_seconds": 6.633,
+      "tok_per_sec": 4872.0,
+      "client_ttft_seconds": 6.633,
+      "client_tok_per_sec": 4872.0,
+      "prompt_tokens": 32316,
       "samples": 2,
       "method": "client",
       "server_validation": {
@@ -295,12 +295,12 @@
       "hardware_summary": {}
     },
     "65536": {
-      "ttft_seconds": 14.39,
-      "prefill_seconds": 14.39,
-      "tok_per_sec": 4483.0,
-      "client_ttft_seconds": 14.39,
-      "client_tok_per_sec": 4483.0,
-      "prompt_tokens": 64514,
+      "ttft_seconds": 13.428,
+      "prefill_seconds": 13.428,
+      "tok_per_sec": 4803.0,
+      "client_ttft_seconds": 13.428,
+      "client_tok_per_sec": 4803.0,
+      "prompt_tokens": 64494,
       "samples": 1,
       "method": "client",
       "server_validation": {
@@ -317,12 +317,12 @@
       "hardware_summary": {}
     },
     "131072": {
-      "ttft_seconds": 32.578,
-      "prefill_seconds": 32.578,
-      "tok_per_sec": 3956.0,
-      "client_ttft_seconds": 32.578,
-      "client_tok_per_sec": 3956.0,
-      "prompt_tokens": 128888,
+      "ttft_seconds": 27.723,
+      "prefill_seconds": 27.723,
+      "tok_per_sec": 4648.0,
+      "client_ttft_seconds": 27.723,
+      "client_tok_per_sec": 4648.0,
+      "prompt_tokens": 128854,
       "samples": 1,
       "method": "client",
       "server_validation": {

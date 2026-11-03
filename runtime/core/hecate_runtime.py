@@ -6,8 +6,9 @@
                   Their EXL3 trellis is never loaded (EXL3_SKIP_TRELLIS=1).
   tensor override EXL3_TENSOR_OVERRIDE: extra tensor files or directories (':'-joined, later ones win), e.g. the warm
                   RTX tier's trellis experts.
-  also installed  EXL3_ROUTER_FUSED (exl3_router), EXL3_DRAFT_HEAD_I4 (exl3_draft_head), EXL3_VERIFY_GRAPH /
-                  EXL3_DRAFT_GRAPH (exl3_vgraph), EXL3_DRAFT_MAX_ROWS (row cap of the decode fast path)."""
+  also installed  EXL3_ROUTER_FUSED (exl3_router), EXL3_NORM_ROUTE (exl3_normroute, with the fused router),
+                  EXL3_DRAFT_HEAD_I4 (exl3_draft_head), EXL3_VERIFY_GRAPH / EXL3_DRAFT_GRAPH (exl3_vgraph),
+                  EXL3_DRAFT_MAX_ROWS (row cap of the decode fast path)."""
 import os, re
 import torch
 from safetensors import safe_open
@@ -240,6 +241,9 @@ def _load():
         _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import exl3_router
         exl3_router.install()
+        if os.environ.get("EXL3_NORM_ROUTE", "0") == "1":
+            import exl3_normroute
+            exl3_normroute.install()
     if os.environ.get("EXL3_DRAFT_HEAD_I4", "0") == "1":
         import sys as _sys
         _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

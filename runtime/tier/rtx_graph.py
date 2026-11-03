@@ -204,6 +204,11 @@ def handoff(m, y, sel, rw, bsz, moe4, cpu=None, zero2=0):
                  v["issue"], 1, bsz, meta, lay, f2, g2, v["done"])
 
 
+def slot_view(m):
+    """layer m's GB300-side slot views (y / s / w host-mapped tensors, issue / done flag pointers)"""
+    return get().slots.views[rs._S.g.index][m._gslot]
+
+
 def slot_layout():
     """(host base, per-slot stride, y / sel / rw offsets) of the per-layer slots, for the CPU band pool"""
     sl = get().slots

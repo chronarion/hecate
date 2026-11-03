@@ -62,6 +62,11 @@ RUN python3 /tmp/p/kvq/apply_kvq.py ${EXT} /tmp/p/kvq
 RUN python3 /tmp/p/norm/apply_norm2.py ${EXT}
 # 10. the decode MoE combine fused into the next block's input norm (EXL3_TIER_COMBINE_NORM, runtime/tier/cn.cu)
 RUN python3 /tmp/p/cn/apply_cn.py ${SP}
+# 11. multi-block radix select for the DSA indexer top-k of few-row selections (decode) and prefill slabs
+#     (EXL3_DSA_TOPK_RADIX)
+RUN python3 /tmp/p/topk/apply_topk_radix.py ${EXT} /tmp/p/topk
+# 12. tcgen05 prefill DSA indexer scoring (runtime/core/hidx.cu, JIT-built; EXL3_HIDX)
+RUN python3 /tmp/p/hidx/apply_hidx.py ${SP}/modules/mla_attn.py /opt/hecate/core/hidx.cu
 RUN cd /opt/exllamav3 && (MAX_JOBS=${MAX_JOBS} python setup.py build_ext > /tmp/build_ext.log 2>&1 \
       || (grep -B2 -A8 -E " error|Error" /tmp/build_ext.log | head -80; exit 1)) \
  && cp build/lib.linux-aarch64-cpython-312/exllamav3_ext.cpython-312-aarch64-linux-gnu.so /opt/venv/lib/python3.12/site-packages/ \
@@ -94,7 +99,8 @@ ENV EXL3_MOE4_SRC=/opt/hecate/tier/moe4 EXL3_TIER_BUILD=/root/.cache/hecate-tier
     EXL3_GRAPHS=1 EXL3_VERIFY_GRAPH=1 EXL3_VERIFY_GRAPH_EVERY=2000 EXL3_DRAFT_GRAPH=1 EXL3_ROUTER_FUSED=1 \
     EXL3_DSA_MULTIROW=1 EXL3_VERIFY_GRAPH_SPARSE=1 EXL3_MLA_KVQ=3 EXL3_TIER_HSIDE=1 EXL3_NORM2=1 EXL3_TIER_COMBINE_NORM=1 \
     EXL3_DSA_TOPK_SPLIT=0 EXL3_MLA_SPLIT_TPS=2 EXL3_MLA_SPLIT_TILES=1 EXL3_MLA_COMBINE_DSPLIT=16 EXL3_COMBINE_CFG=8,1 \
-    EXL3_MLA_BLOCK_H_Q=4 EXL3_WARMUP=1
+    EXL3_MLA_BLOCK_H_Q=4 EXL3_DSA_SCORE_TILE=262144 EXL3_HIDX=1 EXL3_DSA_TOPK_RADIX=16384 \
+    EXL3_NORM_ROUTE=1 EXL3_NORM_ROUTE_HANDOFF=1 EXL3_WARMUP=1
 RUN find ${SP} -name __pycache__ -prune -exec rm -rf {} +
 WORKDIR /opt/tabbyAPI
 EXPOSE 8103

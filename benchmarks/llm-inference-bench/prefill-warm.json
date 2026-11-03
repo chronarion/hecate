@@ -4,7 +4,7 @@
     "engine": "openai_proxy",
     "model": "base",
     "server": "127.0.0.1:8103",
-    "timestamp": "2026-11-02T21:42:16.277849",
+    "timestamp": "2026-11-03T05:49:24.490217",
     "decode_mode": "duration",
     "primary_decode_layer": "sustained_decode",
     "duration_per_test": 30.0,
@@ -185,12 +185,12 @@
   "event_log": [],
   "prefill": {
     "65536": {
-      "ttft_seconds": 14.399,
-      "prefill_seconds": 14.399,
-      "tok_per_sec": 4479.0,
-      "client_ttft_seconds": 14.399,
-      "client_tok_per_sec": 4479.0,
-      "prompt_tokens": 64494,
+      "ttft_seconds": 13.474,
+      "prefill_seconds": 13.474,
+      "tok_per_sec": 4788.0,
+      "client_ttft_seconds": 13.474,
+      "client_tok_per_sec": 4788.0,
+      "prompt_tokens": 64511,
       "samples": 1,
       "method": "client",
       "server_validation": {

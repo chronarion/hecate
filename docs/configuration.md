@@ -8,6 +8,7 @@
 | `HECATE_CACHE_TOKENS` | 524288 | KV page pool shared by all conversations (multiple of 256) |
 | `HECATE_CACHE_MODE` | Q6 | KV cache format (ExLlamaV3 modes; Q6 measured equal to FP16 on KLD) |
 | `HECATE_DRAFTS` | 3 | MTP draft tokens per step (3 measured fastest) |
+| `HECATE_CHUNK` | 8192 | prefill chunk in tokens; 16384 cuts time to first token by another ~8% from 50K tokens up, for 2.6 GiB more GB300 memory while serving (about 55K tokens of KV cache) |
 | `HECATE_PLACEMENT` | `tier-144-85-far27-mtp256` | expert placement file in the weights' `placement/` folder |
 | `HECATE_RTX_I4` | 0 | far experts per layer run as int4 on the RTX (`EXL3_TIER_RTX_I4`; the larger-KV profiles below use 4) |
 | `HECATE_CPU_THREADS` / `HECATE_CPU_CORE0` | 60 / 12 | Grace cold-tier worker threads and their first core |
@@ -44,6 +45,8 @@ experts run, not their weights.
 | `EXL3_MLA_KVQ` | 3 | decode attention with the quantized latent cache: one kernel does the kv_a norm, the rope key, the Q6 group quantization and the paged cache write, on a side branch of the graph that runs while the q_a norm and q_b GEMV run (the absorb kernel applies the query rope); bit-identical cache contents. 3 (default) = also the indexer-key stages of the 21 full-indexer layers on that branch, 1 = the cache append only; 0 = the separate staging, rope, quant and scatter kernels |
 | `EXL3_PRELAUNCH` | 1 | pipelined decode step for a single conversation: the next MTP drafts + verify are launched as soon as a step's accepted tokens are known, before its bookkeeping (needs the two graphs above) |
 | `EXL3_ROUTER_FUSED` | 1 | router GEMV + sigmoid/bias top-8 as one kernel (each top-k round is two warp reductions over order-preserving keys; the same selections as a sequential scan) |
+| `EXL3_NORM_ROUTE` | 1 | decode MoE layers (2..8 rows): the post-attention RMSNorm and the router as one kernel of 4 thread-block clusters x 16 CTAs (`runtime/core/nr4_kernel.cuh`). Each CTA owns the column sets of two of the norm kernel's warps and repeats their partial sums, so the residual and the MoE input are bit-identical to the separate norm; it stages its cluster's 64-expert slice of the gate while the norm runs, the partial logits run on tensor cores and are summed through distributed shared memory, and the clusters' top-8 candidates are merged by the last cluster leader in the fused router's key order (the same selections up to exact near-ties). 0 = the norm kernel + `EXL3_ROUTER_FUSED` |
+| `EXL3_NORM_ROUTE_HANDOFF` | 1 | with `EXL3_NORM_ROUTE`: the same kernel writes the layer's band slot (normed rows, selection, weights) and releases the RTX / Grace ISSUE flags, so the bands start without the handoff kernel; 0 = the handoff kernel (`EXL3_TIER_HSIDE`) |
 | `EXL3_DRAFT_HEAD_I4` | 1 | int4 copy of the LM head for MTP drafts (+0.48 GB) |
 | `EXL3_TIER_SH_FAST` | 1 | shared expert straight into the hot-tier accumulator |
 | `EXL3_TIER_HSIDE` | 1 | decode MoE layers: the handoff kernel (MoE input and routing copied into the RTX / Grace mailboxes, then the release flag) runs on a side stream, so the GB300's shared expert and hot experts start without waiting for it; joined before the combine. `EXL3_TIER_HANDOFF_THREADS` (256) sizes its single block |
@@ -62,6 +65,9 @@ experts run, not their weights.
 | `EXL3_HMLA_DECODE` / `EXL3_HMLA_NS` | 1 / 16 | sparse (DSA) attention of decode steps (contexts above 2,048 tokens) on the tcgen05 kernel, each query row's key list split across NS CTAs; 0 = the Triton split + combine. Shorter contexts keep the Triton kernels |
 | `EXL3_MLA_BLOCK_H_Q`, `EXL3_MLA_SPLIT_TILES`, `EXL3_MLA_COMBINE_DSPLIT`, `EXL3_COMBINE_CFG` | 4, 1, 16, 8,1 | MLA decode launch shapes |
 | `EXL3_DSA_TOPK_SPLIT` | 0 | DSA indexer top-k on one block per row over the live scan width |
+| `EXL3_DSA_TOPK_RADIX` | 16384 | DSA indexer top-k over rows of at least this many keys as a multi-block radix select (4,096-key slices across CTAs: histogram passes, then ordered compaction; rows of up to 3 live slices in one CTA), for up to 16 rows in the decode graphs and up to 256 rows per eager prefill slab; the same index lists as the one-block kernel; 0 = off |
+| `EXL3_DSA_SCORE_TILE` | 262144 | prompt slabs (256 rows) score up to this many keys per indexer call and select with one top-k per row; longer contexts fall back to tiles merged by torch.topk (the merge is exact). ExLlamaV3's default was 32768 |
+| `EXL3_HIDX` | 1 | prefill DSA indexer scoring on the tcgen05 kernel (`runtime/core/hidx.cu`, JIT-built at the first long prompt): 8 queries x 128-key tiles per UMMA chain with the head reduction in the epilogue; bit-identical scores to the Triton kernel; 0 = Triton |
 
 ## Hardware assumptions
 
