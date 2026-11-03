@@ -1,6 +1,6 @@
 # GLM-5.3 KLD (reference: stock BF16; KL(ref || candidate), nats, full vocabulary)
 
-Candidates are the release test runs: release-1 = v1.0, release-2 = v1.1, release-4 = v1.3, release-7 = v1.4, release-8 = v1.5 (v1.2 changed no numerics).
+Candidates are the release test runs: release-1 = v1.0, release-2 = v1.1, release-4 = v1.3, release-7 = v1.4, release-8 = v1.5, release-9 = v1.6 (v1.2 changed no numerics).
 
 | candidate | positions | mean | 95% CI (window bootstrap) | macro mean | median | p95 | p99 | p99.9 | max | JSD | top-1 | NLL ref / cand |
 |---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
@@ -9,6 +9,7 @@ Candidates are the release test runs: release-1 = v1.0, release-2 = v1.1, releas
 | release-4 | 36848 | **0.07378** | 0.06534-0.08158 | 0.07521 | 0.00532 | 0.3355 | 1.1697 | 3.249 | 7.115 | 0.01566 | 0.9264 | 1.0974 / 1.1264 |
 | release-7 | 36848 | **0.07408** | 0.06641-0.08217 | 0.07553 | 0.00530 | 0.3357 | 1.1653 | 3.349 | 6.330 | 0.01572 | 0.9246 | 1.0974 / 1.1273 |
 | release-8 | 36848 | **0.07424** | 0.06638-0.08212 | 0.07575 | 0.00537 | 0.3336 | 1.2126 | 3.205 | 6.868 | 0.01579 | 0.9256 | 1.0974 / 1.1261 |
+| release-9 | 36848 | **0.07382** | 0.06613-0.08176 | 0.07520 | 0.00532 | 0.3425 | 1.1727 | 3.102 | 6.579 | 0.01570 | 0.9258 | 1.0974 / 1.1263 |
 
 Per stratum (mean KL / top-1):
 
@@ -19,6 +20,7 @@ Per stratum (mean KL / top-1):
 | release-4 | 0.0801 / 0.914 | 0.0484 / 0.963 | 0.0842 / 0.892 | 0.0751 / 0.956 | 0.0632 / 0.904 | 0.1002 / 0.940 | 0.07282 | 0.07474 |
 | release-7 | 0.0801 / 0.913 | 0.0494 / 0.962 | 0.0839 / 0.891 | 0.0761 / 0.953 | 0.0635 / 0.899 | 0.1001 / 0.939 | 0.07338 | 0.07479 |
 | release-8 | 0.0803 / 0.911 | 0.0494 / 0.962 | 0.0839 / 0.893 | 0.0758 / 0.953 | 0.0651 / 0.904 | 0.0999 / 0.940 | 0.07293 | 0.07556 |
+| release-9 | 0.0813 / 0.911 | 0.0484 / 0.964 | 0.0834 / 0.892 | 0.0747 / 0.954 | 0.0640 / 0.903 | 0.0994 / 0.941 | 0.07292 | 0.07471 |
 
 Per depth (position in window, mean KL):
 
@@ -29,6 +31,7 @@ Per depth (position in window, mean KL):
 | release-4 | 0.10167 | 0.07827 | 0.07236 | 0.06271 | 0.10019 |
 | release-7 | 0.09952 | 0.07880 | 0.07264 | 0.06332 | 0.10014 |
 | release-8 | 0.09844 | 0.07939 | 0.07244 | 0.06377 | 0.09991 |
+| release-9 | 0.10189 | 0.07850 | 0.07151 | 0.06331 | 0.09938 |
 
 By reference top-1 probability (share of positions, mean KL):
 
@@ -37,13 +40,15 @@ By reference top-1 probability (share of positions, mean KL):
 - release-4: [0.00-0.25] 4.8% 0.1491, [0.25-0.50] 12.2% 0.1530, [0.50-0.75] 13.1% 0.1727, [0.75-0.95] 14.0% 0.1234, [0.95-1.00] 55.9% 0.0144
 - release-7: [0.00-0.25] 4.8% 0.1476, [0.25-0.50] 12.2% 0.1522, [0.50-0.75] 13.1% 0.1729, [0.75-0.95] 14.0% 0.1258, [0.95-1.00] 55.9% 0.0146
 - release-8: [0.00-0.25] 4.8% 0.1505, [0.25-0.50] 12.2% 0.1532, [0.50-0.75] 13.1% 0.1720, [0.75-0.95] 14.0% 0.1260, [0.95-1.00] 55.9% 0.0146
+- release-9: [0.00-0.25] 4.8% 0.1465, [0.25-0.50] 12.2% 0.1536, [0.50-0.75] 13.1% 0.1718, [0.75-0.95] 14.0% 0.1250, [0.95-1.00] 55.9% 0.0144
 
 Paired deltas (same positions; CI from the window bootstrap):
 
-- release-2 - release-1: +0.00005 (95% CI -0.00051 .. +0.00062)
-- release-4 - release-1: -0.00021 (95% CI -0.00099 .. +0.00073)
-- release-7 - release-1: +0.00009 (95% CI -0.00082 .. +0.00127)
-- release-8 - release-1: +0.00026 (95% CI -0.00054 .. +0.00098)
+- release-2 - release-1: +0.00005 (95% CI -0.00050 .. +0.00062)
+- release-4 - release-1: -0.00021 (95% CI -0.00097 .. +0.00074)
+- release-7 - release-1: +0.00009 (95% CI -0.00084 .. +0.00127)
+- release-8 - release-1: +0.00026 (95% CI -0.00048 .. +0.00104)
+- release-9 - release-1: -0.00017 (95% CI -0.00097 .. +0.00063)
 
 Worst contexts (per candidate):
 
@@ -67,3 +72,7 @@ Worst contexts (per candidate):
 - release-8 code-0@312: KL 6.63, ..." The exception raised by ArgumentParser objects when\n        there are errors" -> " with"
 - release-8 long-1@7928: KL 6.25, ..." case is to do nothing, so instead of providing a\n#" -> " function"
 - release-8 code-1@1387: KL 6.18, ..."def _is_param_expr(arg):\n    return arg is ... or" -> " isinstance"
+- release-9 math-0@1398: KL 6.58, ...">>180 miles from home\nHe was only able to drive " -> "4"
+- release-9 math-0@35: KL 6.35, ..." three for breakfast every morning and bakes muffins for her friends" -> " every"
+- release-9 code-0@312: KL 6.27, ..." The exception raised by ArgumentParser objects when\n        there are errors" -> " with"
+- release-9 long-1@7928: KL 5.85, ..." case is to do nothing, so instead of providing a\n#" -> " function"

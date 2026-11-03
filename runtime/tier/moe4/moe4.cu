@@ -32,11 +32,24 @@ constexpr int H = 6144, I = 2048, SPW = 4, WPB = 8, PD = PDV, TOPK = 8, MAXR = 8
 constexpr int GA = I / (16 * SPW), KA = H / 64;        // phase A: 32 groups x 96 k-blocks per matrix
 constexpr int GB = H / (16 * SPW), KBB = I / 64;       // phase B: 96 groups x 32 k-blocks
 constexpr int UA = 2 * GA * KA, UB = GB * KBB;          // units per expert: 6144 (gate + up), 3072 (down)
+// hecate (EXL3_TIER_SH_MOE4): the shared expert as one more slot (index m) of int8 units in the dense GEMV's fragment
+// order (64 rows x 32 k per 2 KB unit): gate+up 2 x 32 groups x 192 k-blocks in phase A, down 96 groups x 64 k-blocks in B
+constexpr int KSA = H / 32, KSB = I / 32;
+constexpr int USA = 2 * GA * KSA, USB = GB * KSB;        // 12288, 6144
 
 __device__ __forceinline__ void mma16816(float* c, const uint32_t* a, uint32_t b0, uint32_t b1)
 {
     asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+// int8 (stored + 128) -> two fp16 pairs (the dense GEMV's decode)
+__device__ __forceinline__ void dec_i8(uint32_t w, uint32_t* a)
+{
+    uint32_t h0, h1;
+    asm("lop3.b32 %0, %1, 0x00ff00ff, 0x64006400, 0xea;" : "=r"(h0) : "r"(w));
+    asm("lop3.b32 %0, %1, 0x00ff00ff, 0x64006400, 0xea;" : "=r"(h1) : "r"(w >> 8));
+    asm("sub.f16x2 %0, %1, %2;" : "=r"(a[0]) : "r"(h0), "r"(0x64806480u));
+    asm("sub.f16x2 %0, %1, %2;" : "=r"(a[1]) : "r"(h1), "r"(0x64806480u));
 }
 __device__ __forceinline__ void dec8(uint32_t w, uint32_t* a)
 {
@@ -169,6 +182,75 @@ __device__ __forceinline__ void stream(int u0, int n, int R, WPtr wptr, XPtr xpt
 }
 
 
+// stream() over int8 units (64 rows x 32 k): the same cursors, ring and flush protocol, the dense GEMV's decode / MMAs
+template <int MATS, int G, int KBN, typename WPtr, typename XPtr, typename Flush>
+__device__ __forceinline__ void stream_i8(int u0, int n, int R, WPtr wptr, XPtr xptr, Flush flush)
+{
+    constexpr int UPM = G * KBN, UPE = MATS * UPM, K = KBN * 32;
+    const int lane = threadIdx.x % 32;
+    int j = u0 / UPE, mat = (u0 % UPE) / UPM, gr = (u0 % UPM) / KBN, kb = u0 % KBN;
+    int pj = j, pmat = mat, pu = u0 % UPM;
+    const uint4* pp = wptr(pj, pmat) + (size_t) pu * 32 * SPW + lane;
+    int left = n;
+    auto advance_p = [&]() {
+        --left; pp += 32 * SPW;
+        if (++pu == UPM) { pu = 0; if (++pmat == MATS) { pmat = 0; ++pj; } if (left > 0) pp = wptr(pj, pmat) + lane; }
+    };
+    uint4 ring[PD][SPW];
+    const int xn = lane / 4, kq = (lane % 4) * 2; const bool live = xn < R;
+    #pragma unroll
+    for (int i = 0; i < PD; ++i)
+    {
+        #pragma unroll
+        for (int s = 0; s < SPW; ++s) ring[i][s] = left > 0 ? __ldg(pp + s * 32) : make_uint4(0, 0, 0, 0);
+        if (left > 0) advance_p();
+    }
+    const uint32_t* xr = (const uint32_t*) (xptr(j) + (size_t) (live ? xn : 0) * K + kq);
+    bool whole = kb == 0;
+    float c[SPW][4];
+    #pragma unroll
+    for (int s = 0; s < SPW; ++s) c[s][0] = c[s][1] = c[s][2] = c[s][3] = 0.f;
+    for (int done = 0; done < n; done += PD)
+    {
+        #pragma unroll
+        for (int jj = 0; jj < PD; ++jj)
+        {
+            if (done + jj >= n) break;
+            const bool more = left > 0;
+            uint32_t bb[4];
+            #pragma unroll
+            for (int t = 0; t < 2; ++t)
+            {
+                const int k0 = kb * 32 + t * 16;
+                bb[2 * t] = live ? __ldg(xr + k0 / 2) : 0u; bb[2 * t + 1] = live ? __ldg(xr + k0 / 2 + 4) : 0u;
+            }
+            #pragma unroll
+            for (int s = 0; s < SPW; ++s)
+            {
+                const uint32_t ww[4] = {ring[jj][s].x, ring[jj][s].y, ring[jj][s].z, ring[jj][s].w};
+                #pragma unroll
+                for (int t = 0; t < 2; ++t) { uint32_t a[4]; dec_i8(ww[2 * t], a); dec_i8(ww[2 * t + 1], a + 2); mma16816(c[s], a, bb[2 * t], bb[2 * t + 1]); }
+                if (more) ring[jj][s] = __ldg(pp + s * 32);
+            }
+            if (more) advance_p();
+            ++kb;
+            if (kb == KBN || done + jj == n - 1)
+            {
+                flush(j, mat, gr, c, whole && kb == KBN);
+                #pragma unroll
+                for (int s = 0; s < SPW; ++s) c[s][0] = c[s][1] = c[s][2] = c[s][3] = 0.f;
+                whole = true;
+                if (kb == KBN)
+                {
+                    kb = 0;
+                    if (++gr == G) { gr = 0; if (++mat == MATS) { mat = 0; ++j; } }
+                    if (done + jj < n - 1) xr = (const uint32_t*) (xptr(j) + (size_t) (live ? xn : 0) * K + kq);
+                }
+            }
+        }
+    }
+}
+
 // stream() with a cp.async shared-memory ring of STAGES units per warp instead of the register ring (gate+up phase:
 // 4.98 vs 3.97 TB/s in the stagebench sweep); same cursors and flush protocol
 constexpr int STAGES = 3;
@@ -246,7 +328,8 @@ __global__ void __launch_bounds__(WPB * 32, 2) moe4_a_kernel
     const int64_t* __restrict__ gate_s, const int64_t* __restrict__ up_s,
     half* __restrict__ act,          // [MAXE][MAXR][I]
     float* gu32,                     // [MAXE][2][MAXR][I], zero
-    int* ctr                         // [MAXE][GA], zero
+    int* ctr,                        // [MAXE][GA], zero
+    const uint4* __restrict__ sh_gw, const uint4* __restrict__ sh_uw   // shared expert int8 gate / up (nullptr: none)
 )
 {
     __shared__ Route rt;
@@ -259,11 +342,13 @@ __global__ void __launch_bounds__(WPB * 32, 2) moe4_a_kernel
 #if defined(V7_ROUTE_ONLY) || defined(V7_SKIP_A)
     return;
 #endif
-    const int m = rt.m; if (m == 0) return;
-    const int total = m * UA, nwarps = gridDim.x * WPB;
+    const int m = rt.m, uh = m * UA, total = uh + (sh_gw ? USA : 0);      // hot int4 units, then the shared expert's int8
+    if (total == 0) return;
+    const int nwarps = gridDim.x * WPB;
     const int upw = (total + nwarps - 1) / nwarps, gw = blockIdx.x * WPB + threadIdx.x / 32;
     const int u0 = gw * upw, n = min(total - u0, upw);
     if (n <= 0) return;
+    const int nh = min(n, max(0, uh - u0));
     const int lane = threadIdx.x % 32;
     auto wptr = [&](int j, int mat) { return (const uint4*) (mat ? up_w : gate_w)[rt.e[min(j, m - 1)]]; };
     auto xptr = [&](int) { return x; };
@@ -304,10 +389,16 @@ __global__ void __launch_bounds__(WPB * 32, 2) moe4_a_kernel
         if (lane == 0) ctr[j * GA + gr] = 0;
     };
 #ifdef V7_REGRING
-    stream<2, GA, KA>(u0, n, R, wptr, xptr, flush);
+    if (nh > 0) stream<2, GA, KA>(u0, nh, R, wptr, xptr, flush);
 #else
-    stream_cp<2, GA, KA>(u0, n, R, wptr, xptr, flush, ring_s + (size_t) (threadIdx.x / 32) * STAGES * SPW * 32);
+    if (nh > 0) stream_cp<2, GA, KA>(u0, nh, R, wptr, xptr, flush, ring_s + (size_t) (threadIdx.x / 32) * STAGES * SPW * 32);
 #endif
+    if (n > nh)          // the shared expert's gate / up units -> gu32 slot m
+    {
+        auto wsh = [&](int, int mat) { return mat ? sh_uw : sh_gw; };
+        auto fsh = [&](int, int mat, int gr, float (*c)[4], bool w) { flush(m, mat, gr, c, w); };
+        stream_i8<2, GA, KSA>(u0 + nh - uh, n - nh, R, wsh, xptr, fsh);
+    }
 }
 
 __global__ void __launch_bounds__(WPB * 32, 2) moe4_b_kernel
@@ -317,7 +408,8 @@ __global__ void __launch_bounds__(WPB * 32, 2) moe4_b_kernel
     const half* __restrict__ act,    // [MAXE][MAXR][I]
     float* __restrict__ y,           // [R][H], accumulated into
     float* y32,                      // [MAXR][H], zero
-    int* ctr                         // [GB], zero
+    int* ctr,                        // [GB], zero
+    const uint4* __restrict__ sh_dw, const float* __restrict__ sh_ds   // shared expert int8 down + row scales (nullptr: none)
 )
 {
     // group-major units: (output group gr, expert slot j, k-block kb); a warp sums its experts in registers (each
@@ -330,12 +422,30 @@ __global__ void __launch_bounds__(WPB * 32, 2) moe4_b_kernel
 #ifdef V7_PDL
     asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
-    const int m = rt.m; if (m == 0) return;
-    const int UG = m * KBB, total = GB * UG, nwarps = gridDim.x * WPB;
+    const int m = rt.m;
+    const int UG = m * KBB, th = GB * UG, total = th + (sh_dw ? USB : 0), nwarps = gridDim.x * WPB;
+    if (total == 0) return;
     const int upw = (total + nwarps - 1) / nwarps, gw = blockIdx.x * WPB + threadIdx.x / 32;
-    const int u0 = gw * upw, n = min(total - u0, upw);
-    if (n <= 0) return;
+    const int u0 = gw * upw, n_all = min(total - u0, upw);
     const int lane = threadIdx.x % 32;
+    const int n = min(n_all, max(0, th - u0));                    // hot units of this warp; the rest are the shared expert's
+    if (n_all > n && n_all > 0)
+    {
+        // shared expert down: int8 units (group, k-block) on act slot m, scaled per row, added into y
+        const int col = (lane % 4) * 2;
+        auto fdn = [&](int, int, int g, float (*c)[4], bool) {
+            #pragma unroll
+            for (int s = 0; s < SPW; ++s)
+            {
+                const int r0 = g * SPW * 16 + s * 16 + lane / 4; const float s0 = sh_ds[r0], s1 = sh_ds[r0 + 8];
+                if (col < R)     { atomicAdd(y + (size_t) col * H + r0, c[s][0] * s0);       atomicAdd(y + (size_t) col * H + r0 + 8, c[s][2] * s1); }
+                if (col + 1 < R) { atomicAdd(y + (size_t) (col + 1) * H + r0, c[s][1] * s0); atomicAdd(y + (size_t) (col + 1) * H + r0 + 8, c[s][3] * s1); }
+            }
+        };
+        const half* ash = act + (size_t) m * MAXR * I;
+        stream_i8<1, GB, KSB>(max(u0, th) - th, n_all - n, R, [&](int, int) { return sh_dw; }, [&](int) { return ash; }, fdn);
+    }
+    if (n <= 0) return;
     int gr = u0 / UG, j = (u0 % UG) / KBB, kb = u0 % KBB;
     // prefetch cursor
     int pgr = gr, pj = j, pkb = kb, left = n;
@@ -477,7 +587,8 @@ __global__ void __launch_bounds__(WPB * 32, 2) moe4_b_kernel
 
 // V7_A_RED: act[j][r][i] = silu(g * gs) * (u * us) * w[j][r] from the complete gate / up sums in gu32 (zeroed again)
 __global__ void __launch_bounds__(256) moe4_act_kernel(const int64_t* __restrict__ sel, const half* __restrict__ rw, int R, int lo,
-    int n_hot, const int64_t* __restrict__ gate_s, const int64_t* __restrict__ up_s, half* __restrict__ act, float* gu32)
+    int n_hot, const int64_t* __restrict__ gate_s, const int64_t* __restrict__ up_s, half* __restrict__ act, float* gu32,
+    const float* __restrict__ sh_gs, const float* __restrict__ sh_us)     // shared expert (slot m, weight 1; nullptr: none)
 {
     __shared__ Route rt;
     route(sel, rw, R, lo, n_hot, rt);
@@ -485,14 +596,15 @@ __global__ void __launch_bounds__(256) moe4_act_kernel(const int64_t* __restrict
     asm volatile("griddepcontrol.wait;" ::: "memory");
     asm volatile("griddepcontrol.launch_dependents;");
 #endif
-    const int m = rt.m, n = m * R * (I / 4);
+    const int m = rt.m, n = (m + (sh_gs ? 1 : 0)) * R * (I / 4);
     for (int q = blockIdx.x * blockDim.x + threadIdx.x; q < n; q += gridDim.x * blockDim.x)
     {
         const int j = q / (R * (I / 4)), r = (q / (I / 4)) % R, i = (q % (I / 4)) * 4;
         float* gp = gu32 + ((size_t) (j * 2) * MAXR + r) * I + i; float* up = gp + (size_t) MAXR * I;
         const float4 g4 = __ldcg((const float4*) gp), u4 = __ldcg((const float4*) up);
-        const float4 gs = *(const float4*) ((const float*) gate_s[rt.e[j]] + i), us = *(const float4*) ((const float*) up_s[rt.e[j]] + i);
-        const float w = rt.w[j][r];
+        const float* gsp = j < m ? (const float*) gate_s[rt.e[j]] : sh_gs; const float* usp = j < m ? (const float*) up_s[rt.e[j]] : sh_us;
+        const float4 gs = *(const float4*) (gsp + i), us = *(const float4*) (usp + i);
+        const float w = j < m ? rt.w[j][r] : 1.f;
         auto f = [&](float g, float s1, float u, float s2) { g *= s1; return __float2half(g / (1.f + __expf(-g)) * u * s2 * w); };
         half2* ap = (half2*) (act + ((size_t) j * MAXR + r) * I + i);
         ap[0] = __halves2half2(f(g4.x, gs.x, u4.x, us.x), f(g4.y, gs.y, u4.y, us.y));
@@ -655,8 +767,12 @@ void moe4_forward(torch::Tensor x, torch::Tensor sel, torch::Tensor rw, int64_t 
                   torch::Tensor gate_w, torch::Tensor up_w, torch::Tensor down_w,
                   torch::Tensor gate_s, torch::Tensor up_s, torch::Tensor down_s,
                   torch::Tensor act, torch::Tensor gu32, torch::Tensor ctr_a, torch::Tensor y32, torch::Tensor ctr_b,
-                  torch::Tensor y, int64_t blocks, int64_t blocks_a, int64_t lo)
+                  torch::Tensor y, int64_t blocks, int64_t blocks_a, int64_t lo,
+                  int64_t sh_gw, int64_t sh_uw, int64_t sh_dw, int64_t sh_gs, int64_t sh_us, int64_t sh_ds)
 {
+    // hecate (EXL3_TIER_SH_MOE4): the shared expert's int8 weights (dense GEMV fragment order) and fp32 row scales; 0 = none
+    const uint4* shg = (const uint4*) sh_gw; const uint4* shu = (const uint4*) sh_uw; const uint4* shd = (const uint4*) sh_dw;
+    const float* shgs = (const float*) sh_gs; const float* shus = (const float*) sh_us; const float* shds = (const float*) sh_ds;
     const at::cuda::OptionalCUDAGuard guard(x.device());
     cudaStream_t st = at::cuda::getCurrentCUDAStream().stream();
     const int R = (int) x.size(0);
@@ -680,20 +796,21 @@ void moe4_forward(torch::Tensor x, torch::Tensor sel, torch::Tensor rw, int64_t 
         cudaLaunchKernelEx(&c, moe4_a_kernel, (const half*) x.data_ptr(), (const int64_t*) sel.data_ptr<int64_t>(), (const half*) rw.data_ptr(),
             R, (int) lo, (int) n_hot, (const int64_t*) gate_w.data_ptr<int64_t>(), (const int64_t*) up_w.data_ptr<int64_t>(),
             (const int64_t*) gate_s.data_ptr<int64_t>(), (const int64_t*) up_s.data_ptr<int64_t>(), (half*) act.data_ptr(), gu32.data_ptr<float>(),
-            ctr_a.data_ptr<int>());
+            ctr_a.data_ptr<int>(), shg, shu);
         cudaLaunchConfig_t c2 = cfg((int) blocks, 0);
         cudaLaunchKernelEx(&c2, moe4_act_kernel, (const int64_t*) sel.data_ptr<int64_t>(), (const half*) rw.data_ptr(), R, (int) lo, (int) n_hot,
-            (const int64_t*) gate_s.data_ptr<int64_t>(), (const int64_t*) up_s.data_ptr<int64_t>(), (half*) act.data_ptr(), gu32.data_ptr<float>());
+            (const int64_t*) gate_s.data_ptr<int64_t>(), (const int64_t*) up_s.data_ptr<int64_t>(), (half*) act.data_ptr(), gu32.data_ptr<float>(),
+            shgs, shus);
         cudaLaunchConfig_t c3 = cfg((int) blocks, 0);
         cudaLaunchKernelEx(&c3, moe4_b_kernel, (const int64_t*) sel.data_ptr<int64_t>(), (const half*) rw.data_ptr(), R, (int) lo, (int) n_hot,
             (const int64_t*) down_w.data_ptr<int64_t>(), (const int64_t*) down_s.data_ptr<int64_t>(), (const half*) act.data_ptr(), y.data_ptr<float>(),
-            y32.data_ptr<float>(), ctr_b.data_ptr<int>());
+            y32.data_ptr<float>(), ctr_b.data_ptr<int>(), shd, shds);
         return;
     }
 #endif
     moe4_a_kernel<<<(int) blocks_a, WPB * 32, SMEM_A, st>>>((const half*) x.data_ptr(), sel.data_ptr<int64_t>(), (const half*) rw.data_ptr(),
         R, (int) lo, (int) n_hot, gate_w.data_ptr<int64_t>(), up_w.data_ptr<int64_t>(), gate_s.data_ptr<int64_t>(), up_s.data_ptr<int64_t>(),
-        (half*) act.data_ptr(), gu32.data_ptr<float>(), ctr_a.data_ptr<int>());
+        (half*) act.data_ptr(), gu32.data_ptr<float>(), ctr_a.data_ptr<int>(), shg, shu);
 #if defined(V7_A_RED) && !defined(V7_NO_ACT)
 #ifdef V7_ACT_WIDE
     moe4_act_kernel<<<(int) blocks, 256, 0, st>>>
@@ -701,11 +818,11 @@ void moe4_forward(torch::Tensor x, torch::Tensor sel, torch::Tensor rw, int64_t 
     moe4_act_kernel<<<64, 256, 0, st>>>
 #endif
         (sel.data_ptr<int64_t>(), (const half*) rw.data_ptr(), R, (int) lo, (int) n_hot,
-        gate_s.data_ptr<int64_t>(), up_s.data_ptr<int64_t>(), (half*) act.data_ptr(), gu32.data_ptr<float>());
+        gate_s.data_ptr<int64_t>(), up_s.data_ptr<int64_t>(), (half*) act.data_ptr(), gu32.data_ptr<float>(), shgs, shus);
 #endif
     moe4_b_kernel<<<(int) blocks, WPB * 32, 0, st>>>(sel.data_ptr<int64_t>(), (const half*) rw.data_ptr(), R, (int) lo, (int) n_hot,
         down_w.data_ptr<int64_t>(), down_s.data_ptr<int64_t>(), (const half*) act.data_ptr(), y.data_ptr<float>(),
-        y32.data_ptr<float>(), ctr_b.data_ptr<int>());
+        y32.data_ptr<float>(), ctr_b.data_ptr<int>(), shd, shds);
 }
 
 std::vector<torch::Tensor> moe4_scratch(torch::Device dev)
@@ -727,7 +844,10 @@ torch::Tensor moe4_dequant(torch::Tensor q, torch::Tensor sc, int64_t N, int64_t
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("dequant", &moe4_dequant);
-    m.def("forward", &moe4_forward);
+    m.def("forward", &moe4_forward, "forward", py::arg("x"), py::arg("sel"), py::arg("rw"), py::arg("n_hot"), py::arg("gate_w"),
+          py::arg("up_w"), py::arg("down_w"), py::arg("gate_s"), py::arg("up_s"), py::arg("down_s"), py::arg("act"), py::arg("gu32"),
+          py::arg("ctr_a"), py::arg("y32"), py::arg("ctr_b"), py::arg("y"), py::arg("blocks"), py::arg("blocks_a"), py::arg("lo"),
+          py::arg("sh_gw") = 0, py::arg("sh_uw") = 0, py::arg("sh_dw") = 0, py::arg("sh_gs") = 0, py::arg("sh_us") = 0, py::arg("sh_ds") = 0);
     m.def("scratch", &moe4_scratch);
     m.def("combine", &moe4_combine);
     m.def("handoff", &moe4_handoff);

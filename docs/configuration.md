@@ -57,6 +57,11 @@ experts run, not their weights.
 | `EXL3_RTX_MOE3` | 1 | run the RTX band on the moe3 trellis MoE kernels; 0 = ExLlamaV3's cooperative MoE kernels |
 | `EXL3_RTX_PREFILL_MOE3P` | 1 | prefill of the RTX band (chunks over 64 rows) on the moe3p kernels: grouped GEMMs that decode the 3-bit trellis inside the MMA loop; 0 = each picked expert reconstructed to FP16 per chunk + grouped GEMMs |
 | `EXL3_TIER_PREFILL_MOE4P` | 1 | prefill of the int4 tiers (chunks over 64 rows) on the moe4p kernels: grouped GEMMs on the stored int4 fragments, the Grace tier read in place over C2C; 0 = bf16 dequant per chunk + grouped GEMMs |
+| `EXL3_TIER_SH_MOE4` | 1 | decode MoE layers run the shared expert inside moe4: its int8 gate / up units join phase A's stream-K list (the dense GEMV's decode), act with weight 1, its down units phase B, instead of a separate gate+up and down GEMV before the hot experts; 0 = the separate GEMVs |
+| `EXL3_I8_CL_CS_LK` | 4 | cluster size of the decode int8 GEMVs with K >= 8192 (o_proj); 0 = the formula (~2 CTAs per SM: 3) |
+| `EXL3_I8_CL_CS_DUAL` | 8 | cluster size of the fused q_a + kv_a GEMV; 0 = the formula (7) |
+| `EXL3_I8_PDL` | 1 | the decode int8 GEMVs launch as programmatic dependents: after the combine-norm (4 CTAs, waiting on the bands), the q_a norm (4 CTAs) and nr4 (64 CTAs) they become resident early, fill their weight rings and wait (griddepcontrol.wait) for their input; each GEMV lets the next kernel launch after its main loop |
+| `EXL3_NORM_PDL` | 1 | RMSNorm launches as a programmatic dependent and lets the next kernel launch at its entry |
 | `EXL3_I8_UNPACK_FUSED` | 1 | prefill unpacks the int8 linears (attention, shared experts, LM head) with one fused kernel; 0 = torch ops (same values) |
 | `EXL3_I8_GEMV_ROWS` | 64 | int8 linears run the decode GEMV in 8-row chunks up to this many rows (decode batches at concurrency 16-32); more rows unpack the weights |
 | `EXL3_RTX_P3_NPOS` / `EXL3_TIER_P4_NPOS` | 16384 / 16384 | expert picks per moe3p / moe4p call (scratch ~45 KB per pick on the RTX / GB300) |

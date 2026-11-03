@@ -177,6 +177,7 @@ __device__ __forceinline__ void cl_units(const uint4* __restrict__ wg, int a, in
         for (int s = 0; s < SPW; ++s) ring[i][s] = pf < pend ? __ldg(pf + s * 32) : make_uint4(0, 0, 0, 0);
         pf += 32 * SPW;
     }
+    asm volatile("griddepcontrol.wait;" ::: "memory");   // hecate (EXL3_I8_PDL): x comes from the previous kernel
     const int xn = lane / 4, kq = (lane % 4) * 2;
     const bool live = xn < M;
     const uint32_t* xr = (const uint32_t*) (x + (size_t) (live ? xn : 0) * K + kq);
@@ -268,6 +269,7 @@ __global__ void __launch_bounds__(WPB * 32) dense_i8_dual_cl_kernel
     #pragma unroll
     for (int s = 0; s < SPW; ++s) c[s][0] = c[s][1] = c[s][2] = c[s][3] = 0.f;
     cl_units<SPW, PD>(w, a, b - a, x, M, K, c);
+    asm volatile("griddepcontrol.launch_dependents;");   // hecate (EXL3_I8_PDL): the next kernel may start its prologue
     cl_block_sum<SPW>(c, red, part);
     cl.sync();
     if (rank == 0)
@@ -306,6 +308,7 @@ __global__ void __launch_bounds__(WPB * 32) dense_i8_gu_cl_kernel
     #pragma unroll
     for (int s = 0; s < SPW; ++s) c[s][0] = c[s][1] = c[s][2] = c[s][3] = 0.f;
     cl_units<SPW, PD>((up ? wu : wg) + (size_t) g * kb_n * 32 * SPW, a, b - a, x, M, K, c);
+    asm volatile("griddepcontrol.launch_dependents;");   // hecate (EXL3_I8_PDL): the next kernel may start its prologue
     {
         const int lane = threadIdx.x % 32;
         #pragma unroll
@@ -363,7 +366,7 @@ __global__ void __launch_bounds__(WPB * 32) dense_i8_cl_kernel
     if constexpr (LR)
     {
         const int tcl = lr.nt / CS;              // the first tcl clusters compute t slices (scheduled first)
-        if (g < tcl) { lr_t_block(x, lr.v, lr.t, M, K, lr.nt, blockIdx.x); return; }
+        if (g < tcl) { asm volatile("griddepcontrol.wait;" ::: "memory"); lr_t_block(x, lr.v, lr.t, M, K, lr.nt, blockIdx.x); return; }
         g -= tcl;
     }
     bool lr_need = false;
@@ -395,6 +398,7 @@ __global__ void __launch_bounds__(WPB * 32) dense_i8_cl_kernel
             for (int s = 0; s < SPW; ++s) ring[i][s] = pf < pend ? __ldg(pf + s * 32) : make_uint4(0, 0, 0, 0);
             pf += 32 * SPW;
         }
+        asm volatile("griddepcontrol.wait;" ::: "memory");   // hecate (EXL3_I8_PDL): x comes from the previous kernel
         const int xn = lane / 4, kq = (lane % 4) * 2;
         const bool live = xn < M;
         const uint32_t* xr = (const uint32_t*) (x + (size_t) (live ? xn : 0) * K + kq);
@@ -432,6 +436,7 @@ __global__ void __launch_bounds__(WPB * 32) dense_i8_cl_kernel
             }
         }
     }
+    asm volatile("griddepcontrol.launch_dependents;");   // hecate (EXL3_I8_PDL): the next kernel may start its prologue
     #pragma unroll
     for (int s = 0; s < SPW; ++s)
         #pragma unroll
@@ -1128,11 +1133,17 @@ void launch(const at::Tensor& x, const at::Tensor& w8, const at::Tensor& scale, 
     if (i8_cl_on())
     {
         static const int cl_bps = [] { const char* e = getenv("EXL3_I8_CL_BPS"); return e ? atoi(e) : 2; }();
+        // hecate: EXL3_I8_CL_CS_LK = cluster size for K >= 8192 (o_proj: 4 beat the formula's 3 by 1.5 us in the chain bench)
+        static const int cs_lk = [] { const char* e = getenv("EXL3_I8_CL_CS_LK"); return e ? atoi(e) : 0; }();
         int CS = (sms * cl_bps + groups / 2) / groups;
+        if (cs_lk > 0 && K >= 8192) CS = cs_lk;
         CS = std::max(1, std::min(8, std::min(CS, kb_n / WPB)));
-        cudaLaunchConfig_t cfg = {}; cudaLaunchAttribute at[1];
+        cudaLaunchConfig_t cfg = {}; cudaLaunchAttribute at[2];
         at[0].id = cudaLaunchAttributeClusterDimension; at[0].val.clusterDim.x = CS; at[0].val.clusterDim.y = 1; at[0].val.clusterDim.z = 1;
-        cfg.gridDim = dim3(groups * CS); cfg.blockDim = dim3(WPB * 32); cfg.dynamicSmemBytes = 0; cfg.stream = stream; cfg.attrs = at; cfg.numAttrs = 1;
+        // hecate (EXL3_I8_PDL): programmatic dependent of the previous kernel (weights prefetched before griddepcontrol.wait)
+        static const bool i8_pdl = [] { const char* e = getenv("EXL3_I8_PDL"); return e && atoi(e) != 0; }();
+        at[1].id = cudaLaunchAttributeProgrammaticStreamSerialization; at[1].val.programmaticStreamSerializationAllowed = 1;
+        cfg.gridDim = dim3(groups * CS); cfg.blockDim = dim3(WPB * 32); cfg.dynamicSmemBytes = 0; cfg.stream = stream; cfg.attrs = at; cfg.numAttrs = i8_pdl ? 2 : 1;
         LRArgs lra{nullptr, nullptr, nullptr, nullptr, 0};
         if (lrp)
         {
@@ -1275,9 +1286,12 @@ void dense_i8_gu_act_gr
         static const int cl_bps = [] { const char* e = getenv("EXL3_I8_CL_BPS"); return e ? atoi(e) : 2; }();
         const int groups = N / 64, kb_n = K / 32;
         int CS = std::max(1, std::min(8, std::min((sms * cl_bps + groups / 2) / groups, kb_n / WPB)));
-        cudaLaunchConfig_t cfg = {}; cudaLaunchAttribute at[1];
+        cudaLaunchConfig_t cfg = {}; cudaLaunchAttribute at[2];
         at[0].id = cudaLaunchAttributeClusterDimension; at[0].val.clusterDim.x = CS; at[0].val.clusterDim.y = 1; at[0].val.clusterDim.z = 1;
-        cfg.gridDim = dim3(groups * CS); cfg.blockDim = dim3(WPB * 32); cfg.stream = stream; cfg.attrs = at; cfg.numAttrs = 1;
+        // hecate (EXL3_I8_PDL): programmatic dependent of the previous kernel (weights prefetched before griddepcontrol.wait)
+        static const bool i8_pdl = [] { const char* e = getenv("EXL3_I8_PDL"); return e && atoi(e) != 0; }();
+        at[1].id = cudaLaunchAttributeProgrammaticStreamSerialization; at[1].val.programmaticStreamSerializationAllowed = 1;
+        cfg.gridDim = dim3(groups * CS); cfg.blockDim = dim3(WPB * 32); cfg.stream = stream; cfg.attrs = at; cfg.numAttrs = i8_pdl ? 2 : 1;
         auto kc = dense_i8_gu_cl_kernel<4, 2>;
         cuda_check(cudaLaunchKernelEx(&cfg, kc, (const uint4*) wg.data_ptr(), (const float*) sg.data_ptr(), (const uint4*) wu.data_ptr(),
             (const float*) su.data_ptr(), (const half*) x.data_ptr(), (half*) act.data_ptr(), M, N, K));
@@ -1330,10 +1344,15 @@ void dense_i8_dual_gr
     {
         static const int cl_bps = [] { const char* e = getenv("EXL3_I8_CL_BPS"); return e ? atoi(e) : 2; }();
         const int groups = Na / 64 + Nb / 64, kb_n = K / 32;
-        int CS = std::max(1, std::min(8, std::min((sms * cl_bps + groups / 2) / groups, kb_n / WPB)));
-        cudaLaunchConfig_t cfg = {}; cudaLaunchAttribute at[1];
+        // hecate: EXL3_I8_CL_CS_DUAL = cluster size of the q_a + kv_a GEMV (8 beat the formula's 7 by 0.7 us in the chain bench)
+        static const int cs_dual = [] { const char* e = getenv("EXL3_I8_CL_CS_DUAL"); return e ? atoi(e) : 0; }();
+        int CS = std::max(1, std::min(8, std::min(cs_dual > 0 ? cs_dual : (sms * cl_bps + groups / 2) / groups, kb_n / WPB)));
+        cudaLaunchConfig_t cfg = {}; cudaLaunchAttribute at[2];
         at[0].id = cudaLaunchAttributeClusterDimension; at[0].val.clusterDim.x = CS; at[0].val.clusterDim.y = 1; at[0].val.clusterDim.z = 1;
-        cfg.gridDim = dim3(groups * CS); cfg.blockDim = dim3(WPB * 32); cfg.stream = stream; cfg.attrs = at; cfg.numAttrs = 1;
+        // hecate (EXL3_I8_PDL): programmatic dependent of the previous kernel (weights prefetched before griddepcontrol.wait)
+        static const bool i8_pdl = [] { const char* e = getenv("EXL3_I8_PDL"); return e && atoi(e) != 0; }();
+        at[1].id = cudaLaunchAttributeProgrammaticStreamSerialization; at[1].val.programmaticStreamSerializationAllowed = 1;
+        cfg.gridDim = dim3(groups * CS); cfg.blockDim = dim3(WPB * 32); cfg.stream = stream; cfg.attrs = at; cfg.numAttrs = i8_pdl ? 2 : 1;
         auto kc = dense_i8_dual_cl_kernel<4, 2>;
         cuda_check(cudaLaunchKernelEx(&cfg, kc, (const uint4*) wa.data_ptr(), (const float*) sa.data_ptr(), (half*) ya.data_ptr(), Na,
             (const uint4*) wb.data_ptr(), (const float*) sb.data_ptr(), (half*) yb.data_ptr(), Nb, (const half*) x.data_ptr(), M, K));

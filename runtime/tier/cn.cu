@@ -44,6 +44,9 @@ __global__ void __launch_bounds__(NT) combine_norm_kernel(const float* __restric
     float* __restrict__ y, const float* __restrict__ o2, const unsigned* done, float* __restrict__ r,
     const weight_t* __restrict__ w, half* __restrict__ xn, float eps, float cbias, float cscale, int dim)
 {
+    // hecate (EXL3_I8_PDL): the next layer's q_a / kv_a GEMV may launch now and fill its weight ring while this kernel
+    // waits for the bands (it reads xn only after griddepcontrol.wait, i.e. after this kernel completes)
+    asm volatile("griddepcontrol.launch_dependents;");
     if (done)
     {
         if (threadIdx.x == 0) while (*(volatile const unsigned*) done < 1u) __nanosleep(100);

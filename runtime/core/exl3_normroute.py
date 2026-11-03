@@ -75,7 +75,8 @@ def _ext_mod():
         _ext = load_inline(name="exl3_normroute4", cpp_sources=_DECL, cuda_sources=_HOST,
                            functions=["norm_route"], build_directory=bd,
                            extra_include_paths=[_DIR],
-                           extra_cuda_cflags=["-O3", "--use_fast_math", "-gencode=arch=compute_103a,code=sm_103a"])
+                           extra_cuda_cflags=["-O3", "--use_fast_math", "-gencode=arch=compute_103a,code=sm_103a"]
+                           + (["-DNR4_PDL"] if os.environ.get("EXL3_I8_PDL", "0") == "1" else []))
     return _ext
 
 

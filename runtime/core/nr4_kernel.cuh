@@ -118,6 +118,11 @@ __global__ void __launch_bounds__(NT, 1) nr4_kernel(const Params p)
     float* Ss = (float*) (smem + SM_W + SM_X + SM_PW + SM_P + SM_L);
     int* flag = (int*) (smem + SM_W + SM_X + SM_PW + SM_P + SM_L + SM_S);
     const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5, M = p.M;
+#ifdef NR4_PDL
+    // hecate (EXL3_I8_PDL): let moe4 phase A (a programmatic dependent that waits before reading the routing) become
+    // resident on the 88 SMs this kernel leaves idle
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
 #ifdef NR_STAMPS
     auto stamp = [&](int i) { if (tid == 0) { unsigned long long t; asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t)); p.st[blockIdx.x * 8 + i] = t; } };
 #else

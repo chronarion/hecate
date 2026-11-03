@@ -47,6 +47,9 @@ HSIDE = os.environ.get("EXL3_TIER_HSIDE", "0") == "1"
 # EXL3_TIER_COMBINE_NORM=1: a decode MoE layer whose output goes to the next block's fused input norm leaves its combine
 # to that norm: cn.cu waits for the bands, adds the partials, updates the residual and normalizes in one kernel
 COMBINE_NORM = os.environ.get("EXL3_TIER_COMBINE_NORM", "0") == "1"
+# EXL3_TIER_SH_MOE4=1: decode rows <= 8 run the shared expert inside moe4 (its int8 gate / up units in phase A's stream-K
+# list, act with weight 1, its down units in phase B) instead of the separate gate+up and down GEMVs before moe4
+SH_MOE4 = os.environ.get("EXL3_TIER_SH_MOE4", "0") == "1"
 NPOS4 = int(os.environ.get("EXL3_TIER_P4_NPOS", "16384"))
 _VG = {"cap": False}   # set by exl3_vgraph while it captures a whole-forward graph (the RTX graph is launched outside)
 H_, I_ = 6144, 2048
@@ -459,6 +462,31 @@ def tier_nr_handoff(self, bsz):
     return (v["y"].data_ptr(), v["s"].data_ptr(), v["w"].data_ptr(), v["issue"], 1, meta, lay, f2, g2, v["done"])
 
 
+def _sh_i8(sh):
+    """EXL3_TIER_SH_MOE4: (gate_w, up_w, down_w, gate_s, up_s, down_s) device pointers of the shared expert's int8 copies
+    (dense GEMV fragment order, 4 strips per group), or None when its linears do not all have one"""
+    out = []
+    for names in (("gates", "gate", "gate_proj"), ("ups", "up", "up_proj"), ("downs", "down", "down_proj")):
+        mod = next((getattr(sh, nm) for nm in names if getattr(sh, nm, None) is not None), None)
+        if isinstance(mod, (list, tuple)):           # GatedMLP keeps one Linear per slice
+            mod = mod[0] if len(mod) == 1 else None
+        w8 = getattr(getattr(mod, "inner", None), "w8", None)
+        if w8 is None or w8[4] != 4:
+            print(f" -- tier: shared expert not in moe4 (no int8 copy for {names[0]}: {type(mod).__name__}; "
+                  f"attributes {[a for a in vars(sh) if not a.startswith('_')][:12]})", flush=True)
+            return None
+        out.append(w8)
+    (gq, gs), (uq, us), (dq, ds) = [(w[0], w[1]) for w in out]
+    global _SH_SAID
+    if not _SH_SAID:
+        _SH_SAID = True
+        print(f" -- tier: shared expert inside moe4 (int8 gate / up / down, {gs.numel()} x {uq.numel() // gs.numel()})", flush=True)
+    return (gq.data_ptr(), uq.data_ptr(), dq.data_ptr(), gs.data_ptr(), us.data_ptr(), ds.data_ptr())
+
+
+_SH_SAID = False
+
+
 def tier_submit(self, y, bsz, selected_experts, routing_weights):
     L = self._L
     if not _CPU.started and _far(self):
@@ -489,12 +517,18 @@ def tier_submit(self, y, bsz, selected_experts, routing_weights):
     y = y.contiguous().view(-1, y.shape[-1])
     if bsz <= 8:
         yh = T.y[:bsz]                                # left zeroed by the previous layer's combine
+        shp = ()
         if getattr(self, "_sh_fast", False) and sh is not None:
-            sh.bc.run_bszN(y.view(1, bsz, -1), yh.view(1, bsz, -1))   # shared expert into the accumulator (overwrite)
+            if SH_MOE4:
+                if not hasattr(self, "_sh_ptrs"):
+                    self._sh_ptrs = _sh_i8(sh)
+                shp = self._sh_ptrs or ()
+            if not shp:
+                sh.bc.run_bszN(y.view(1, bsz, -1), yh.view(1, bsz, -1))   # shared expert into the accumulator (overwrite)
             self.shared_experts = None                # restored by the forward wrapper
         moe4.forward(y, selected_experts.view(bsz, -1).contiguous(), routing_weights.view(bsz, -1).contiguous(),
                      Hh.hot if Hh.far else Hh.n, Hh.tab["gate_w"], Hh.tab["up_w"], Hh.tab["down_w"],
-                     Hh.tab["gate_s"], Hh.tab["up_s"], Hh.tab["down_s"], *T.scr, yh, T.blocks, T.blocks_a, 0)
+                     Hh.tab["gate_s"], Hh.tab["up_s"], Hh.tab["down_s"], *T.scr, yh, T.blocks, T.blocks_a, 0, *shp)
         hot = ("main", bsz)
     elif pend[0] == "gb300":
         hot = ("pre", _prefill_gb300(self, y, selected_experts.view(bsz, -1), routing_weights.view(bsz, -1)))

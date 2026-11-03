@@ -41,6 +41,10 @@ struct Pool
     // hecate: counter and sense on separate cache lines (adjacent, every fetch_add fought the spinners for the line)
     alignas(128) std::atomic<uint32_t> bar_count{0};
     alignas(128) std::atomic<uint32_t> bar_sense{0};
+    // hecate: gather barrier: each thread releases its own line, thread 0 acquires them all, then releases bar_sense
+    // (a 60-way fetch_add on one line serialized ~4 us per barrier when the threads arrived together; this is ~0.8 us)
+    struct alignas(128) Flag { std::atomic<uint32_t> v{0}; };
+    Flag bar_flag[64];
     int R = 0, P = 0, L = -1; int pick[MAXP]; float wgt[MAXP][MAXR]; int nr[MAXP]; int rows[MAXP][MAXR];
     alignas(64) int8_t xqp[MAXP][MAXR * H]; float xgp[MAXP][MAXR * H / 32];   // x rows of each pick's rows, compacted
     alignas(64) int8_t xq[MAXR * H]; float xg[MAXR * H / 32];
@@ -52,16 +56,19 @@ Pool* g_pool = nullptr;
 
 inline float h2f(uint16_t h) { __fp16 v; memcpy(&v, &h, 2); return (float) v; }
 
-void barrier(Pool& P, uint32_t& local_sense)
+void barrier(Pool& P, int t, uint32_t& gen)
 {
-    local_sense ^= 1u;
-    if (P.bar_count.fetch_add(1, std::memory_order_acq_rel) + 1 == (uint32_t) P.nt)
+    ++gen;
+    if (t == 0)
     {
-        P.bar_count.store(0, std::memory_order_relaxed);
-        P.bar_sense.store(local_sense, std::memory_order_release);
+        for (int i = 1; i < P.nt; ++i) while (P.bar_flag[i].v.load(std::memory_order_acquire) != gen) asm volatile("yield");
+        P.bar_sense.store(gen, std::memory_order_release);
     }
     else
-        while (P.bar_sense.load(std::memory_order_acquire) != local_sense) asm volatile("yield");
+    {
+        P.bar_flag[t].v.store(gen, std::memory_order_release);
+        while (P.bar_sense.load(std::memory_order_acquire) != gen) asm volatile("yield");
+    }
 }
 
 inline void split(int n, int t, int nt, int& a, int& b) { a = (int) ((int64_t) n * t / nt); b = (int) ((int64_t) n * (t + 1) / nt); }
@@ -153,7 +160,7 @@ void worker(int t)
                 for (int r = 0; r < P.R; ++r) if (P.wgt[p][r] != 0.f) P.rows[p][P.nr[p]++] = r;
             }
         }
-        barrier(P, sense);
+        barrier(P, t, sense);
         const int R = P.R, NP = P.skip ? 0 : P.P;
         if (R > 0 && NP == 0)
         {
@@ -165,11 +172,11 @@ void worker(int t)
             // x -> int8 groups
             { int a, b; split(R * H / 32, t, P.nt, a, b);
               for (int gi = a; gi < b; ++gi) { float v[32]; for (int k = 0; k < 32; ++k) v[k] = h2f(P.x[(size_t) gi * 32 + k]); quant_group(v, P.xq + gi * 32, P.xg + gi); } }
-            barrier(P, sense);
+            barrier(P, t, sense);
             { int a, b; split(NP * MAXR, t, P.nt, a, b);
               for (int w = a; w < b; ++w) { const int p = w / MAXR, j = w % MAXR; if (j >= P.nr[p]) continue; const int r = P.rows[p][j];
                   memcpy(P.xqp[p] + (size_t) j * H, P.xq + (size_t) r * H, H); memcpy(P.xgp[p] + (size_t) j * (H / 32), P.xg + (size_t) r * (H / 32), H / 32 * 4); } }
-            barrier(P, sense);
+            barrier(P, t, sense);
             // gate + up rows of every pick
             { int a, b; split(NP * 2 * I, t, P.nt, a, b);
               for (int w = a; w < b; ) {
@@ -177,7 +184,7 @@ void worker(int t)
                   const int e = P.pick[p];
                   gemv_rows(m ? Ly.u[e] : Ly.g[e], m ? Ly.us[e] : Ly.gs[e], P.xqp[p], P.xgp[p], H, P.nr[p], n0, n1, m ? &P.uy[p][0][0] : &P.gy[p][0][0], I);
                   w += n1 - n0; } }
-            barrier(P, sense);
+            barrier(P, t, sense);
             // act = silu(g) * u * routing weight -> int8 groups
             { int a, b; split(NP * MAXR * I / 32, t, P.nt, a, b);
               for (int gi = a; gi < b; ++gi) {
@@ -186,7 +193,7 @@ void worker(int t)
                   float v[32]; const float wt = P.wgt[p][P.rows[p][r]];
                   for (int k = 0; k < 32; ++k) { const float gg = P.gy[p][r][k0 + k]; v[k] = gg / (1.f + expf(-gg)) * P.uy[p][r][k0 + k] * wt; }
                   quant_group(v, &P.aq[p][r][k0], &P.ag[p][r][k0 / 32]); } }
-            barrier(P, sense);
+            barrier(P, t, sense);
             // down rows, summed over picks in registers
             { int a, b; split(H, t, P.nt, a, b);
               float tmp[MAXR];
@@ -198,7 +205,7 @@ void worker(int t)
                       for (int j = 0; j < P.nr[p]; ++j) tmp[P.rows[p][j]] += y1[j]; }
                   for (int r = 0; r < R; ++r) P.out[(size_t) r * H + n] = tmp[r]; } }
         }
-        barrier(P, sense);
+        barrier(P, t, sense);
         if (t == 0) { ++P.jobs; P.busy += NP; __atomic_store_n(P.done, g, __ATOMIC_RELEASE); }
     }
 }
