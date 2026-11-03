@@ -137,7 +137,7 @@ docker compose up -d    # OpenAI-compatible API on :8103
 Hardware requirements:
 - a DGX Station GB300 or an equivalent GB300 + Blackwell PCIe GPU + Grace system;
 - driver 615 or newer;
-- ~120 GB of free host RAM.
+- ~150 GB of free host RAM (default profile).
 
 ## License and credits
 

@@ -149,7 +149,9 @@ Requirements:
 - Docker with the NVIDIA Container Toolkit's CDI spec (`/var/run/cdi/nvidia.yaml`; DGX OS 7 generates it, otherwise
   `sudo nvidia-ctk cdi generate --output=/var/run/cdi/nvidia.yaml`);
 - the `hf` CLI (`huggingface_hub`) and ~360 GB of disk for the weights;
-- ~120 GB of free host RAM (the cold tier and pinned buffers).
+- ~150 GB of free host RAM with the default profile (cold tier, pinned buffers, and a pinned copy of the RTX band for
+  long prompts that `EXL3_PREFILL_GB300_ROWS=0` drops, ~85 GB, along with the GB300-only long prefill); the 1M profile
+  below keeps more experts in host RAM.
 
 **1. Get the code and the weights**
 
