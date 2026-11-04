@@ -29,7 +29,7 @@ GGUF or safetensors checkpoint.
 
 | | |
 |---|---|
-| Decode, concurrency 1 (10 prompts × 3 passes, greedy, MTP 3 drafts) | ~181 tok/s |
+| Decode, concurrency 1 (10 prompts, greedy, MTP 3 drafts) | ~184 tok/s |
 | KL divergence vs BF16 (rtx6kpro protocol, 36,848 positions) | 0.0735 (see the benchmarks below) |
 | Context | 2 × 256K (Q6 KV) by default; one 1M-token conversation with the long-context profile |
 
@@ -91,8 +91,8 @@ Past 2,048 tokens of context the model's sparse attention (DSA) takes over. Sing
 
 #### Our speed test
 
-10 chat prompts × 3 passes, greedy, 400 tokens, concurrency 1: **~181 tok/s** (179.5-182.8 in the 1.7 release
-test; 1.6: ~174 in the same session). A 27K-token prompt: prefill 4,648 tok/s, then 163 tok/s decode; a 109K-token
+10 chat prompts, greedy, 400 tokens, concurrency 1: **~184 tok/s** (180.9-188.8 over the 1.8 test passes; 1.7: ~181
+in the same session). A 27K-token prompt: prefill 4,648 tok/s, then 163 tok/s decode; a 109K-token
 prompt: prefill 4,712 tok/s, then 158 tok/s (means of 2 runs; single runs vary ±10%).
 
 #### KLD compared with other GLM-5.3 quants

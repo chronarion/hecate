@@ -371,9 +371,11 @@ __global__ void __launch_bounds__(NT, 1) nr4_kernel(const Params p)
     {
         if (p.hmeta) { p.hmeta[0] = p.hm0; p.hmeta[1] = (unsigned) M; }
         if (p.hzero) *(volatile unsigned*) p.hzero = 0u;
+        // one system fence orders every prior write; both ISSUE stores are then relaxed and leave back to back (two
+        // st.release.sys serialized a host round trip before the second, the Grace's; -1.3 us per layer), Grace first
         __threadfence_system();
-        asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(p.hflag), "r"(p.hgen) : "memory");
-        if (p.hflag2) asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(p.hflag2), "r"(p.hgen2) : "memory");
+        if (p.hflag2) asm volatile("st.relaxed.sys.global.u32 [%0], %1;" :: "l"(p.hflag2), "r"(p.hgen2) : "memory");
+        asm volatile("st.relaxed.sys.global.u32 [%0], %1;" :: "l"(p.hflag), "r"(p.hgen) : "memory");
     }
     stamp(7);
 }

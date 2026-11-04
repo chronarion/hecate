@@ -1,7 +1,7 @@
 # Hecate: Hybrid Inference and Quantization for DGX Station (ExLlamaV3)
 
 Hecate serves **GLM-5.3 (753B MoE)** on a single **NVIDIA DGX Station GB300** at concurrency-1 decode speeds of
-**~181 tok/s** (stock model, MTP speculative decoding, 2 × 256K context). Its KL divergence to the BF16 model is lower
+**~184 tok/s** (stock model, MTP speculative decoding, 2 × 256K context). Its KL divergence to the BF16 model is lower
 than the published 3-bit EXL3 quant's.
 
 The model does not fit in any one memory of the machine. Hecate splits every MoE layer across all three processors at
@@ -21,7 +21,7 @@ release, [zai-org/GLM-5.3-BF16](https://huggingface.co/zai-org/GLM-5.3-BF16).
 
 | | Value |
 |---|---|
-| Decode, concurrency 1, 10 prompts × 3 passes, greedy, 400 tokens | **~181 tok/s** (stock; 179.5-182.8 in the release test passes) |
+| Decode, concurrency 1, 10 prompts, greedy, 400 tokens | **~184 tok/s** (stock; 180.9-188.8 over the 1.8 test passes) |
 | Decode vs context (llm-inference-bench, C=1, mean of 3 runs) | 16K: 144 · 32K: 156 · 64K: 148 · 128K: 146 tok/s |
 | One long prompt, then 300 tokens of decode (mean of 2 runs) | 27K: 4,648 tok/s prefill, 163 tok/s decode · 109K: 4,712 / 158 |
 | Prefill (llm-inference-bench standalone, cold) | ~4,800 tok/s at 8K-32K, 4,750 at 64K, 4,600 at 128K; time to first token 0.3 s at 1K |
@@ -107,6 +107,7 @@ credits public work the change builds on; "—" means it came out of profiling t
 | Weight loads that skip L1 in the hot-tier MoE kernel | `moe4` streamed the expert weights through L1, evicting the activations (x in phase A, act in phase B) that every warp re-reads; the weight loads are now `ld.global.nc.L1::no_allocate`, and phase B prefetches its first units into L2 before it waits for act (weights and routing do not depend on it). Same arithmetic | +1.2% | — |
 | MoE combine launched behind the hot band | the combine-norm that ends each MoE layer launches as a programmatic dependent of `moe4`'s down phase: it becomes resident as that phase drains, waits for the RTX and Grace bands itself (the separate Grace wait kernel is gone), loads the bands' partials, the residual and the norm weight, and reads the hot band's sum only after the phase completes; the layer also stops zero-filling a routed sum nothing reads. Bit-identical | +0.9% | programmatic dependent launch (CUDA) |
 | Activations in MMA-fragment order | `moe4` multiplied every 2 KB weight unit by activations it gathered with eight 4-byte loads per lane; the norm + router kernel now also writes the MoE input, and the activation kernel writes act, in the m16n8k16 B-fragment layout, so each unit takes two 16-byte loads. Bit-identical | +0.8% | — |
+| Earlier band start | each Grace job began with thread 0 parsing the job header the GPU wrote (which experts, which rows) while the other 59 threads waited, then all 60 quantized the MoE input into int8 groups behind a barrier; the 59 now quantize every row while thread 0 parses, and that barrier is gone (-3.8 µs per job with picks). The norm + router kernel released the Grace and RTX bands with two `st.release.sys` stores, the second waiting out a host round trip after the first; one system fence now orders every prior write and both flags leave back to back as relaxed stores (-1.3 µs per layer). Bit-identical | +1.6% | — |
 | Smaller wins | token embedding in HBM (removes a host sync per draft), int4 draft LM head, MTP layer in int4, fused shared-expert gate + up + SiLU, shared expert straight into the hot-tier accumulator | +1-3% each | int4 draft-only LM head: [b12x](https://github.com/local-inference-lab/b12x) |
 
 **Fidelity.** These changes made the model closer to BF16 than the published 3-bit quant, not just faster:
