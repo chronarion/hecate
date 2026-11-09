@@ -24,6 +24,8 @@ services:
       HECATE_CACHE_TOKENS: ${HECATE_CACHE_TOKENS:-524288}
       HECATE_CACHE_MODE: ${HECATE_CACHE_MODE:-Q6}
       HECATE_DRAFTS: ${HECATE_DRAFTS:-3}
+      # system-RAM tier behind the KV pool, in GB (0 = off; docs/configuration.md, "System-RAM KV tier")
+      HECATE_SYSMEM_KV_GB: ${HECATE_SYSMEM_KV_GB:-0}
       HECATE_MODEL_DIR: /weights
       HECATE_MODEL_NAME: base
       EXL3_TIER_SPLIT: /weights/placement/${HECATE_PLACEMENT:-tier-144-85-far27-mtp256}.json

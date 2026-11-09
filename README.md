@@ -215,6 +215,18 @@ HECATE_MAX_SEQ_LEN=1048576
 HECATE_CACHE_TOKENS=1048576
 ```
 
+**Returning conversations: turn on the system-RAM cache.** The GPU keeps up to 512K tokens of recent conversations, so
+a follow-up message only has to read its new part. When other conversations push one out, its whole history has to be
+read again next time: ~17 s for 80,000 tokens. If the machine has spare RAM, keep those conversations there instead.
+Add to `.env` (the amount is reserved when the server starts, on top of the ~150 GB above):
+
+```bash
+HECATE_SYSMEM_KV_GB=200     # GB of system RAM, ~4M tokens of conversations
+```
+
+A pushed-out 80,000-token conversation then comes back in about a second instead of 17. This matters most for coding
+agents and chat apps, which resend the whole conversation on every turn.
+
 [docs/configuration.md](docs/configuration.md) lists every setting and the profiles in between.
 
 ## Repository layout

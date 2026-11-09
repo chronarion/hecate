@@ -3,12 +3,15 @@
    HECATE_CACHE_TOKENS   KV page pool shared by all conversations (multiple of 256)        default 2 x max_seq_len
    HECATE_CACHE_MODE     KV cache format: Q6 (default), Q8, FP16 ... (ExLlamaV3 cache modes)
    HECATE_DRAFTS         MTP draft tokens per step                                          default 3
+   HECATE_SYSMEM_KV_GB   system-RAM tier behind the KV pool, in GB (0 = off): finished pages leaving the GPU pool
+                         are kept there and copied back when a later prompt starts with them   default 0
    HECATE_PORT, HECATE_MODEL_DIR (directory holding the model folder), HECATE_MODEL_NAME (the folder)"""
 import os
 e = os.environ.get
 max_seq = int(e("HECATE_MAX_SEQ_LEN", "262144"))
 cache = int(e("HECATE_CACHE_TOKENS", str(2 * max_seq)))
 cache = max(cache, max_seq) // 256 * 256
+sysmem_mb = int(float(e("HECATE_SYSMEM_KV_GB", "0")) * 1024)
 cfg = f"""network:
   host: 0.0.0.0
   port: {int(e("HECATE_PORT", "8103"))}
@@ -34,6 +37,9 @@ model:
 draft_model:
   draft_mode: mtp
   draft_num_tokens: {int(e("HECATE_DRAFTS", "3"))}
+memory:
+  sysmem_kv_cache: {sysmem_mb}
 """
 open("/opt/tabbyAPI/config.yml", "w").write(cfg)
-print(f"hecate: max_seq_len {max_seq}, cache {cache} tokens ({e('HECATE_CACHE_MODE', 'Q6')}), drafts {e('HECATE_DRAFTS', '3')}", flush=True)
+print(f"hecate: max_seq_len {max_seq}, cache {cache} tokens ({e('HECATE_CACHE_MODE', 'Q6')}), drafts {e('HECATE_DRAFTS', '3')}, "
+      f"system-RAM KV tier {sysmem_mb >> 10} GB", flush=True)

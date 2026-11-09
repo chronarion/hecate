@@ -8,6 +8,7 @@
 | `HECATE_CACHE_TOKENS` | 524288 | KV page pool shared by all conversations (multiple of 256) |
 | `HECATE_CACHE_MODE` | Q6 | KV cache format (ExLlamaV3 modes; Q6 measured equal to FP16 on KLD) |
 | `HECATE_DRAFTS` | 3 | MTP draft tokens per step (3 measured fastest) |
+| `HECATE_SYSMEM_KV_GB` | 0 | system-RAM tier behind the KV pool, in GB (0 = off; see "System-RAM KV tier" below) |
 | `HECATE_CHUNK` | 8192 | prefill chunk in tokens; 16384 cuts time to first token by another ~8% from 50K tokens up, for 2.6 GiB more GB300 memory while serving (about 55K tokens of KV cache) |
 | `HECATE_PLACEMENT` | `tier-144-85-far27-mtp256` | expert placement file in the weights' `placement/` folder |
 | `HECATE_RTX_I4` | 0 | far experts per layer run as int4 on the RTX (`EXL3_TIER_RTX_I4`; the larger-KV profiles below use 4) |
@@ -35,6 +36,18 @@ then). Placements come from `tools/placement/kv_placement.py`. It moves the cold
 With `HECATE_RTX_I4=k`, the first k of those run as int4 on the RTX instead of on the Grace cores (same weights); the RTX
 band then uses ExLlamaV3's cooperative MoE kernels instead of `moe3`. Every placement here is lossless: they change where
 experts run, not their weights.
+
+### System-RAM KV tier
+
+`HECATE_SYSMEM_KV_GB` turns on ExLlamaV3's second-tier page cache (TabbyAPI `memory.sysmem_kv_cache`). Finished
+256-token pages that leave the GPU pool are copied into page-locked system memory, and a later prompt that starts with
+them gets them copied back instead of prefilled again. The GPU pool still bounds what the conversations in flight can
+hold; the tier keeps the ones that come back, such as agent sessions and chats pushed out by other traffic. The whole
+tier is allocated and locked at start, on top of Hecate's own host memory, so the host must have it free.
+
+Measured on the DGX Station GB300: an 82K-token prompt pushed out of the GPU pool by ~1.3M tokens of other prompts came
+back in 1.0 s instead of 16.8 s of prefill, with the same answers (`tools/bench/kvtier.py`). A 200 GB tier holds ~4M
+tokens, 8x the default pool.
 
 ## Runtime switches (validated defaults are baked into the image)
 

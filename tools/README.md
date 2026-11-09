@@ -31,4 +31,6 @@ This follows the local-inference-lab rtx6kpro protocol.
 - `bench/speed.py`: 10 fixed prompts, greedy, 400 tokens.
 - `bench/qa.py`: 6 known-answer questions.
 - `bench/longctx.py`: one long prompt, reporting prefill and decode speed at that depth.
+- `bench/kvtier.py`: the system-RAM KV tier: a long document with planted facts is pushed out of the GPU pool and
+  asked about again (needs `HECATE_SYSMEM_KV_GB` > 0 to come back fast).
 - The community benchmark (`llm-inference-bench`) invocations are in `bench/llm_inference_bench.sh`.
