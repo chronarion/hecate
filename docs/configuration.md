@@ -8,9 +8,12 @@
 | `HECATE_CACHE_TOKENS` | 524288 | KV page pool shared by all conversations (multiple of 256) |
 | `HECATE_CACHE_MODE` | Q6 | KV cache format (ExLlamaV3 modes; Q6 measured equal to FP16 on KLD) |
 | `HECATE_DRAFTS` | 3 | MTP draft tokens per step (3 measured fastest) |
-| `HECATE_SYSMEM_KV_GB` | 0 | system-RAM tier behind the KV pool, in GB (0 = off; see "System-RAM KV tier" below) |
+| `HECATE_SYSMEM_KV_GB` | 200 | system-RAM tier behind the KV pool, in GB (0 = off; see "System-RAM KV tier" below) |
+| `HECATE_MAX_BATCH` | 8 | requests that decode at the same time; more wait in the queue (see "Concurrency" below; 0 = ExLlamaV3's 128) |
+| `HECATE_INTERACTIVE_RESERVE` | 2 | of those, slots that non-streamed requests leave free for streamed ones |
+| `HECATE_PRIORITY` | `stream` | streamed requests start ahead of non-streamed ones; `off` = first come, first served |
 | `HECATE_CHUNK` | 8192 | prefill chunk in tokens; 16384 cuts time to first token by another ~8% from 50K tokens up, for 2.6 GiB more GB300 memory while serving (about 55K tokens of KV cache) |
-| `HECATE_PLACEMENT` | `tier-144-85-far27-mtp256` | expert placement file in the weights' `placement/` folder |
+| `HECATE_PLACEMENT` | `tier-144-85-far27-mtp256-r2` | expert placement file in the weights' `placement/` folder |
 | `HECATE_RTX_I4` | 0 | far experts per layer run as int4 on the RTX (`EXL3_TIER_RTX_I4`; the larger-KV profiles below use 4) |
 | `HECATE_CPU_THREADS` / `HECATE_CPU_CORE0` | 60 / 12 | Grace cold-tier worker threads and their first core |
 | `HECATE_CONFIG` | — | path to a complete TabbyAPI config.yml inside the container (overrides the above) |
@@ -27,19 +30,40 @@ Larger pools come from moving experts out of HBM:
 
 | Profile | `HECATE_PLACEMENT` | `HECATE_RTX_I4` | KV pool fits | Decode, c=1 (stock) |
 |---|---|---|---|---|
-| default | `tier-144-85-far27-mtp256` | 0 | 512K | ~148 tok/s |
+| default | `tier-144-85-far27-mtp256-r2` | 0 | 512K | ~176 tok/s (short greedy bench) |
 | +5.4 GB | `tier-140-85-far31-mtp256` | 4 | ~620K (622,592 tested) | ~131 tok/s (-5% vs the default then) |
 | 1M | `tier-120-85-far51-mtp256` | 4 | 1M (16 GB HBM left) | ~100 tok/s (-27%); 375K-token prompt: 1,507 tok/s prefill, 67 tok/s decode |
 
 The two larger profiles were measured on release 2, before the pipelined decode step (the default ran ~140 tok/s
 then). Placements come from `tools/placement/kv_placement.py`. It moves the coldest hot experts to the head of the cold tier.
+The default (`-r2`, release 1.9) ranks each layer's int4 experts by how often decode steps picked them over ~30K verify
+steps of reasoning, code, long-context, tool-use, editing and chat traffic (`EXL3_ROUTE_LOG`,
+`tools/placement/rerank_placement.py`); the 1.8 ranking (`tier-144-85-far27-mtp256`, 24 short prompts) put experts that
+code and tool calls use often on the Grace band. The larger profiles still use the 1.8 ranking.
 With `HECATE_RTX_I4=k`, the first k of those run as int4 on the RTX instead of on the Grace cores (same weights); the RTX
-band then uses ExLlamaV3's cooperative MoE kernels instead of `moe3`. Every placement here is lossless: they change where
-experts run, not their weights.
+band then uses ExLlamaV3's cooperative MoE kernels instead of `moe3`. Placements change where experts run, not their
+weights; the Grace band computes with 8-bit activations, so an expert that moves between HBM and the Grace computes slightly
+differently (the default's KLD is measured: 0.0734 with `-r2` vs 0.0739 with the 1.8 ranking, same code).
+
+### Concurrency
+
+Hecate is built for a few conversations at a time. A decode step processes every running request's rows together; up to
+8 rows it stays on a fast path (CUDA graphs, the fused MoE kernels, the RTX and Grace bands), and above 8 rows each step
+falls back to a much slower path. So by default at most 8 requests decode at once (`HECATE_MAX_BATCH`) and the rest wait
+in the queue: a waiting request starts late but then runs at full speed, instead of every request crawling at a few
+tokens per second and running into client timeouts. MTP drafts take rows too: one conversation drafts 3 tokens per
+step, two conversations 3 each, four conversations 1 each, eight none.
+
+Streamed requests (chat front ends, coding agents) are treated as interactive and start before non-streamed ones (batch
+jobs, evaluations), and batch requests may only fill `HECATE_MAX_BATCH - HECATE_INTERACTIVE_RESERVE` slots, so an
+interactive turn starts within a step even when a batch client keeps the queue full. With only batch traffic the reserve
+leaves those slots idle; set `HECATE_INTERACTIVE_RESERVE=0` for a batch-only server. A gateway in front of Hecate
+should also limit each client's parallel requests and must not retry timed-out generations (the retry runs the whole
+generation again).
 
 ### System-RAM KV tier
 
-`HECATE_SYSMEM_KV_GB` turns on ExLlamaV3's second-tier page cache (TabbyAPI `memory.sysmem_kv_cache`). Finished
+`HECATE_SYSMEM_KV_GB` (200 GB by default since 1.9; 0 turns it off) sizes ExLlamaV3's second-tier page cache (TabbyAPI `memory.sysmem_kv_cache`). Finished
 256-token pages that leave the GPU pool are copied into page-locked system memory, and a later prompt that starts with
 them gets them copied back instead of prefilled again. The GPU pool still bounds what the conversations in flight can
 hold; the tier keeps the ones that come back, such as agent sessions and chats pushed out by other traffic. The whole
@@ -61,6 +85,8 @@ tokens, 8x the default pool.
 | `EXL3_NORM_ROUTE` | 1 | decode MoE layers (2..8 rows): the post-attention RMSNorm and the router as one kernel of 4 thread-block clusters x 16 CTAs (`runtime/core/nr4_kernel.cuh`). Each CTA owns the column sets of two of the norm kernel's warps and repeats their partial sums, so the residual and the MoE input are bit-identical to the separate norm; it stages its cluster's 64-expert slice of the gate while the norm runs, the partial logits run on tensor cores and are summed through distributed shared memory, and the clusters' top-8 candidates are merged by the last cluster leader in the fused router's key order (the same selections up to exact near-ties). 0 = the norm kernel + `EXL3_ROUTER_FUSED` |
 | `EXL3_NORM_ROUTE_HANDOFF` | 1 | with `EXL3_NORM_ROUTE`: the same kernel writes the layer's band slot (normed rows, selection, weights) and releases the RTX / Grace ISSUE flags, so the bands start without the handoff kernel; 0 = the handoff kernel (`EXL3_TIER_HSIDE`) |
 | `EXL3_DRAFT_HEAD_I4` | 1 | int4 copy of the LM head for MTP drafts (+0.48 GB) |
+| `EXL3_DRAFT_COUPLE` | 1 | sampled requests (temperature > 0): each MTP draft is picked with the same random noise the sampler will use at that position (ExLlamaV3 samples by adding Gumbel noise to the logits and taking the largest), so a draft matches the sampled token far more often when the draft and the model agree on the likely candidates. The sampler itself is untouched, so the output is exactly what it was; only the speed changes. Greedy requests are unaffected. Measured with `tools/bench/specmix.py` at temperature 1: +10% tokens per step, +6% decode speed |
+| `EXL3_COPY_DRAFT` | 1 | one conversation whose newest `EXL3_COPY_MIN` (16) tokens repeat earlier context (code edits, tool arguments that quote a file, quoted documents) verifies the up to `EXL3_COPY_MAX` (7) tokens that followed that earlier occurrence instead of the MTP drafts (the MTP draft passes still run, so their cache stays complete); the output is unchanged. Measured with `tools/bench/specmix.py` (agent turns that write files, edits): 3.8 -> 5.5 tokens per step, +22% decode speed; no change on reasoning, code and long-context questions |
 | `EXL3_TIER_SH_FAST` | 1 | shared expert straight into the hot-tier accumulator |
 | `EXL3_TIER_HSIDE` | 1 | decode MoE layers: the handoff kernel (MoE input and routing copied into the RTX / Grace mailboxes, then the release flag) runs on a side stream, so the GB300's shared expert and hot experts start without waiting for it; joined before the combine. `EXL3_TIER_HANDOFF_THREADS` (256) sizes its single block |
 | `EXL3_TIER_COMBINE_NORM` | 1 | decode MoE layers whose output goes straight to the next block's input norm leave their combine (wait for the RTX / Grace bands, add the partials) to that norm: one kernel adds the partials, updates the residual and normalizes (runtime/tier/cn.cu); bit-identical |
@@ -85,6 +111,7 @@ tokens, 8x the default pool.
 | `EXL3_PREFILL_GB300_ROWS` | 2048 | prompt chunks above this many rows run every routed expert on the GB300's tensor cores: the int4 tiers on the tcgen05 grouped GEMM `moe4t` (gate and up in one CTA, SiLU epilogue), the RTX band's 3-bit trellis on `moe3t`, read in place over C2C from a pinned copy in Grace memory (~85 GB host RAM; +0.7 GB HBM scratch), on a second stream; the RTX idles. Shorter chunks keep the split path above; 0 = off |
 | `EXL3_HMLA_PREFILL` | 1 | sparse (DSA) attention of prompt chunks on the tcgen05 kernel (`docker/patches/exllamav3/hmla`); 0 = the Triton gather kernel |
 | `EXL3_HMLA_DECODE` / `EXL3_HMLA_NS` | 1 / 16 | sparse (DSA) attention of decode steps (contexts above 2,048 tokens) on the tcgen05 kernel, each query row's key list split across NS CTAs; 0 = the Triton split + combine. Shorter contexts keep the Triton kernels |
+| `EXL3_ROUTE_LOG` | unset | file to append every decode step's expert selection to (`tools/placement/route_stats.py`, `rerank_placement.py`) |
 | `EXL3_MLA_BLOCK_H_Q`, `EXL3_MLA_SPLIT_TILES`, `EXL3_MLA_COMBINE_DSPLIT`, `EXL3_COMBINE_CFG` | 4, 1, 16, 8,1 | MLA decode launch shapes |
 | `EXL3_DSA_TOPK_SPLIT` | 0 | DSA indexer top-k on one block per row over the live scan width |
 | `EXL3_DSA_TOPK_RADIX` | 16384 | DSA indexer top-k over rows of at least this many keys as a multi-block radix select (4,096-key slices across CTAs: histogram passes, then ordered compaction; rows of up to 3 live slices in one CTA), for up to 16 rows in the decode graphs and up to 256 rows per eager prefill slab; the same index lists as the one-block kernel; 0 = off |

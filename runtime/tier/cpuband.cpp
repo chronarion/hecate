@@ -18,7 +18,10 @@
 
 namespace {
 
-constexpr int H = 6144, I = 2048, MAXR = 8, TOPK = 8, MAXP = 8;
+constexpr int H = 6144, I = 2048, MAXR = 8, TOPK = 8;
+// distinct cold picks per job: every selection of a job can be a distinct cold expert (MAXR * TOPK); with 8 the 9th
+// and later distinct picks of a job were skipped (their rows lost those experts' contributions)
+constexpr int MAXP = MAXR * TOPK;
 
 struct Layer { int lo = 0, n = 0, slot = -1; std::vector<const uint8_t*> g, u, d; std::vector<const float*> gs, us, ds; };
 

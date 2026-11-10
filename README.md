@@ -1,7 +1,8 @@
 # Hecate: Hybrid Inference and Quantization for DGX Station (ExLlamaV3)
 
 Hecate serves **GLM-5.3 (753B MoE)** on a single **NVIDIA DGX Station GB300** at concurrency-1 decode speeds of
-**~184 tok/s** (stock model, MTP speculative decoding, 2 × 256K context). Its KL divergence to the BF16 model is lower
+**144-212 tok/s** on realistic sampled workloads and **~176 tok/s** on short greedy prompts (stock model, MTP
+speculative decoding, 2 × 256K context). Its KL divergence to the BF16 model is lower
 than the published 3-bit EXL3 quant's.
 
 The model does not fit in any one memory of the machine. Hecate splits every MoE layer across all three processors at
@@ -21,11 +22,12 @@ release, [zai-org/GLM-5.3-BF16](https://huggingface.co/zai-org/GLM-5.3-BF16).
 
 | | Value |
 |---|---|
-| Decode, concurrency 1, 10 prompts, greedy, 400 tokens | **~184 tok/s** (stock; 180.9-188.8 over the 1.8 test passes) |
-| Decode vs context (llm-inference-bench, C=1, mean of 3 runs) | 16K: 144 · 32K: 156 · 64K: 148 · 128K: 146 tok/s |
-| One long prompt, then 300 tokens of decode (mean of 2 runs) | 27K: 4,648 tok/s prefill, 163 tok/s decode · 109K: 4,712 / 158 |
+| Decode, concurrency 1, realistic workloads (temperature 1) | **144-212 tok/s** by workload (table below) |
+| Decode, concurrency 1, 10 prompts, greedy, 400 tokens | **~176 tok/s** (stock; 172-179 over 6 server restarts; 1.8: ~181) |
+| Decode vs context (llm-inference-bench, C=1) | 16K: 152 · 32K: 156 · 64K: 150 · 128K: 146 tok/s |
+| One long prompt, then 300 tokens of decode (release 1.8, mean of 2 runs) | 27K: 4,648 tok/s prefill, 163 tok/s decode · 109K: 4,712 / 158 |
 | Prefill (llm-inference-bench standalone, cold) | ~4,800 tok/s at 8K-32K, 4,750 at 64K, 4,600 at 128K; time to first token 0.3 s at 1K |
-| KL divergence vs BF16 (rtx6kpro protocol, 36,848 positions) | **0.0735** (published EXL3 3.0 bpw: 0.1013) |
+| KL divergence vs BF16 (rtx6kpro protocol, 36,848 positions) | **0.0734** (published EXL3 3.0 bpw: 0.1013) |
 | Context | 2 × 256K Q6 KV by default; a single 1M-token conversation with the long-context profile |
 
 ## Benchmarks
@@ -35,27 +37,51 @@ the default 512K-token KV pool (cells that would not fit in it are skipped). The
 so the server samples at TabbyAPI's default of 1.0 (our own speed test is greedy). Raw JSON and logs:
 [`benchmarks/`](benchmarks/), invocations in [`tools/bench/llm_inference_bench.sh`](tools/bench/llm_inference_bench.sh).
 
-**Decode, aggregate tok/s by context and concurrency** (mean of the runs that measured the cell; C=1 cells from up to 3 runs):
+**Decode, aggregate tok/s by context and concurrency** (release 1.9; mean of the runs that measured the cell):
 
 | Context | C=1 | C=2 | C=4 | C=8 | C=16 | C=32 |
 |---|---:|---:|---:|---:|---:|---:|
-| 0 | 177 | 221 | 125 | 261 | 155 | 256 |
-| 4K | 161 | 170 | 124 | 271 | - | - |
-| 16K | 144 | 193 | 122 | 264 | - | - |
-| 32K | 156 | 191 | 122 | 267 | - | - |
-| 64K | 148 | 179 | 120 | - | - | - |
-| 128K | 146 | 169 | - | - | - | - |
+| 0 | 168 | 209 | 117 | 247 | 8 run + 8 queue | 8 run + 24 queue |
+| 4K | 148 | 185 | 117 | 251 | - | - |
+| 16K | 152 | 182 | 113 | 246 | - | - |
+| 32K | 156 | 172 | 115 | 247 | - | - |
+| 64K | 150 | 181 | 114 | - | - | - |
+| 128K | 146 | 172 | - | - | - | - |
 
-Each request gets the aggregate divided by C. Hecate is tuned for one or two conversations: from 4 concurrent requests
-it trims MTP drafts to stay on the 8-row decode fast path (4: one draft, 8: none), and from 16 it leaves that path.
-Single C=1 cells vary by up to ±10% between runs, because MTP acceptance depends on the generated text.
+Each request gets the aggregate divided by C. Hecate is tuned for a few conversations: at most 8 requests decode at
+once (`HECATE_MAX_BATCH`) and later ones wait in the queue, then run at full speed: at C=16 each request decoded at ~31
+tok/s once it started, ~250 tok/s in aggregate, after waiting ~37 s on average for a slot (the benchmark's own aggregate
+for queued cells is not meaningful). MTP drafts take rows too: 4 concurrent requests get one draft each, 8 none.
+Streamed requests start ahead of non-streamed ones (docs/configuration.md, "Concurrency"). Single C=1 cells vary by up
+to ±10% between runs, because MTP acceptance depends on the generated text; on this benchmark 1.9 and 1.8 measured the
+same at C=1 in one session (the 1.9 gains show on the workloads below).
 
-**Prefill, standalone and cold** (one request, mean of 2 rounds; time to first token includes the first decode step):
+On our short greedy test 1.9 is ~3% slower than 1.8 (~176 vs ~181 tok/s, means over 6 and 3 server restarts; a single
+restart moves it by ±3%). Switching the new drafts or the request scheduling off does not change it. About 1% comes from
+the new expert placement, which is ranked for real traffic rather than for this test (1.9 with the old placement: ~178);
+the rest is likely the Grace band fix, which now computes experts that were skipped before.
+
+**Realistic workloads** (`tools/bench/specmix.py`, temperature 1, release 1.8 vs 1.9 in one session, tokens per second
+of decode):
+
+| Workload | 1.8 | 1.9 |
+|---|---:|---:|
+| Reasoning | 136 | 146 |
+| Code | 139 | 146 |
+| Questions about a 46K-token document | 136 | 144 |
+| Everyday chat (reasoning effort low) | 156 | 154 |
+| Agent turns with tool calls that write files, file edits | 146 | 212 |
+
+**Prefill, standalone and cold** (one request; time to first token includes the first decode step):
 
 | Prompt | 1K | 4K | 8K | 16K | 32K | 64K | 128K |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Prefill tok/s | 3,380 | 3,870 | 4,768 | 4,836 | 4,810 | 4,750 | 4,602 |
-| Time to first token | 0.3 s | 1.1 s | 1.7 s | 3.4 s | 6.7 s | 13.6 s | 28.0 s |
+| Prefill tok/s | 3,407 | 3,885 | 4,767 | 4,834 | 4,817 | 4,769 | 4,609 |
+| Time to first token | 0.3 s | 1.1 s | 1.7 s | 3.4 s | 6.7 s | 13.5 s | 28.0 s |
+
+Once the 512K-token GPU pool is full, the pages a long prompt pushes out are copied into the system-RAM conversation
+cache while it prefills, which makes prompts from 16K up ~5% slower (4,330-4,590 tok/s); with `HECATE_SYSMEM_KV_GB=0`
+they are dropped instead and prefill stays at the numbers above.
 
 Prompts are processed in 8K-token chunks. Through release 1.2 every chunk paid a fixed ~1.7 s, because each picked expert was
 dequantized once per chunk (time to first token 2.0 s even at 1K tokens); the prefill MoE kernels removed that.
@@ -108,6 +134,9 @@ credits public work the change builds on; "—" means it came out of profiling t
 | MoE combine launched behind the hot band | the combine-norm that ends each MoE layer launches as a programmatic dependent of `moe4`'s down phase: it becomes resident as that phase drains, waits for the RTX and Grace bands itself (the separate Grace wait kernel is gone), loads the bands' partials, the residual and the norm weight, and reads the hot band's sum only after the phase completes; the layer also stops zero-filling a routed sum nothing reads. Bit-identical | +0.9% | programmatic dependent launch (CUDA) |
 | Activations in MMA-fragment order | `moe4` multiplied every 2 KB weight unit by activations it gathered with eight 4-byte loads per lane; the norm + router kernel now also writes the MoE input, and the activation kernel writes act, in the m16n8k16 B-fragment layout, so each unit takes two 16-byte loads. Bit-identical | +0.8% | — |
 | Earlier band start | each Grace job began with thread 0 parsing the job header the GPU wrote (which experts, which rows) while the other 59 threads waited, then all 60 quantized the MoE input into int8 groups behind a barrier; the 59 now quantize every row while thread 0 parses, and that barrier is gone (-3.8 µs per job with picks). The norm + router kernel released the Grace and RTX bands with two `st.release.sys` stores, the second waiting out a host round trip after the first; one system fence now orders every prior write and both flags leave back to back as relaxed stores (-1.3 µs per layer). Bit-identical | +1.6% | — |
+| Drafts that share the sampler's randomness (1.9) | ExLlamaV3 samples a token by adding random (Gumbel) noise to the scores and taking the largest; the MTP draft head now adds the same noise for the same position, so for sampled requests a draft lands on the token the model will actually sample far more often. The sampler is untouched, so the output is exactly what it was | +6% decode at temperature 1 (+10% tokens per step) | drafter-invariant speculative decoding ([Daliri, Musco, Suresh](https://arxiv.org/abs/2408.07978)) |
+| Copy drafts (1.9) | when the newest 16 tokens repeat earlier text (a tool call writing back a file it read, an edited file, a quoted document), the step checks up to 7 tokens copied from there instead of the 3 model drafts; ExLlamaV3's suffix automaton finds the match | +22% on file-writing and editing turns; no change elsewhere | [SuffixDecoding](https://arxiv.org/abs/2411.04975), prompt lookup decoding |
+| Expert placement from real requests (1.9) | which int4 experts sit in GPU memory and which on the Grace CPU is now ranked from ~30K decode steps of reasoning, code, long-context, tool-use, editing and chat requests (the old ranking came from 24 short prompts and sent experts that code uses often to the CPU) | +4% on reasoning / code / chat, +16% on agent and editing turns | activation-aware expert placement (MoE-Infinity) |
 | Smaller wins | token embedding in HBM (removes a host sync per draft), int4 draft LM head, MTP layer in int4, fused shared-expert gate + up + SiLU, shared expert straight into the hot-tier accumulator | +1-3% each | int4 draft-only LM head: [b12x](https://github.com/local-inference-lab/b12x) |
 
 **Fidelity.** These changes made the model closer to BF16 than the published 3-bit quant, not just faster:
@@ -119,8 +148,12 @@ credits public work the change builds on; "—" means it came out of profiling t
 - the attention projections, shared experts, dense MLPs and LM head are int8 straight from BF16; the router, DSA
   indexer, kv_b_proj and the MTP eh_proj stay FP16.
 
-KLD is 0.0735 (release 1.6: 0.0738; paired difference -0.0003, 95% CI -0.0007 .. +0.0002), against 0.1013 for the
-published EXL3 3.0 bpw on the same windows.
+KLD is 0.0734, against 0.1013 for the published EXL3 3.0 bpw on the same windows. Release 1.9 lowered it in a paired
+run on the same positions: 1.8 scored 0.0748 there, the Grace band fix alone 0.0739 (-0.0009, 95% CI -0.0016 .. -0.0001),
+and the fix with the new expert placement 0.0734 (-0.0014, 95% CI -0.0027 .. -0.0000). Until 1.9 the Grace band dropped
+a decode step's 9th and later distinct cold experts in a layer (about 4% of steps on code and agent text, more with 8-row
+steps); experts that move between the GPU and the Grace band compute with fp16 vs 8-bit activations, so the placement
+change is measured rather than assumed lossless.
 
 ### KLD compared with other GLM-5.3 quants
 
@@ -135,7 +168,7 @@ group shares one exact window set.
 
 | Quant | bpw | KLD | Evaluation set |
 |---|---|---|---|
-| **Hecate** (this release) | 3.8² | **0.0735**¹ | ours: 18 windows, 36,848 positions (wiki, code, chat, math, zh, two 8K windows), verify-shape decode path |
+| **Hecate** (this release) | 3.8² | **0.0734**¹ | ours: 18 windows, 36,848 positions (wiki, code, chat, math, zh, two 8K windows), verify-shape decode path |
 | Infatoshi EXL3 3.0 bpw (scored by us) | 3.04 | 0.1013 | ours, same windows (against the BF16 of its own lineage) |
 | brandonmusic EXL3 TR3 | 3.0 | 0.0979 | 16 sealed windows, 32,752 positions |
 | vcruz305 EXL3 | 3.38 | 0.0948 | own set, 10,240 positions, 1,024-token sequences |
@@ -164,7 +197,8 @@ Requirements:
 - the `hf` CLI (`huggingface_hub`) and ~360 GB of disk for the weights;
 - ~150 GB of free host RAM with the default profile (cold tier, pinned buffers, and a pinned copy of the RTX band for
   long prompts that `EXL3_PREFILL_GB300_ROWS=0` drops, ~85 GB, along with the GB300-only long prefill); the 1M profile
-  below keeps more experts in host RAM.
+  below keeps more experts in host RAM. The system-RAM conversation cache adds 200 GB by default (~350 GB in all;
+  `HECATE_SYSMEM_KV_GB` sets or turns it off, see "Returning conversations").
 
 **1. Get the code and the weights**
 
@@ -215,17 +249,16 @@ HECATE_MAX_SEQ_LEN=1048576
 HECATE_CACHE_TOKENS=1048576
 ```
 
-**Returning conversations: turn on the system-RAM cache.** The GPU keeps up to 512K tokens of recent conversations, so
-a follow-up message only has to read its new part. When other conversations push one out, its whole history has to be
-read again next time: ~17 s for 80,000 tokens. If the machine has spare RAM, keep those conversations there instead.
-Add to `.env` (the amount is reserved when the server starts, on top of the ~150 GB above):
+**Returning conversations: the system-RAM cache (on by default).** The GPU keeps up to 512K tokens of recent
+conversations, so a follow-up message only has to read its new part. When other conversations push one out, its whole
+history would have to be read again: ~17 s for 80,000 tokens. Since 1.9, 200 GB of system RAM (~4M tokens) keep those
+conversations, and a pushed-out 80,000-token conversation comes back in about a second. This matters most for coding
+agents and chat apps, which resend the whole conversation on every turn. The amount is reserved when the server starts,
+on top of the ~150 GB above; on a host with less free RAM, set a smaller size or turn it off in `.env`:
 
 ```bash
-HECATE_SYSMEM_KV_GB=200     # GB of system RAM, ~4M tokens of conversations
+HECATE_SYSMEM_KV_GB=0       # GB of system RAM for pushed-out conversations (default 200)
 ```
-
-A pushed-out 80,000-token conversation then comes back in about a second instead of 17. This matters most for coding
-agents and chat apps, which resend the whole conversation on every turn.
 
 [docs/configuration.md](docs/configuration.md) lists every setting and the profiles in between.
 

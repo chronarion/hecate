@@ -249,6 +249,35 @@ def handoff(m, y, sel, rw, bsz, moe4, cpu=None, zero2=0):
                  v["issue"], 1, bsz, meta, lay, f2, g2, v["done"])
 
 
+_RLOG = {}
+
+
+def log_routing(R):
+    """EXL3_ROUTE_LOG=path: append this decode step's expert selection of every tier layer, read from the pinned slots
+    after the verify forward has finished (call before the next step can be launched). Record: u16 0xA55A, u16 layers,
+    u16 rows, then int16 [layers][rows][top-k] placement-local ids (0 .. 255 in the layer's placement order); the first
+    record of a file is a header: u16 0xA55B, u16 layers, then int16 layer index per slot. tools/placement/route_stats.py
+    reads it."""
+    path = os.environ.get("EXL3_ROUTE_LOG")
+    if not path or R < 1 or R > R8 or not MODS:
+        return
+    import numpy as np, struct
+    if not _RLOG:
+        import ctypes
+        sl = get().slots
+        _RLOG["f"] = open(path, "ab", buffering=1 << 20)
+        _RLOG["a"] = np.ctypeslib.as_array((ctypes.c_uint8 * (sl.per * sl.n)).from_address(sl.hbuf)).reshape(sl.n, sl.per)
+        _RLOG["sl"] = sl
+        lay = []
+        for m in MODS:
+            k = (getattr(m, "key", "") or "").split(".")
+            lay.append(int(k[k.index("layers") + 1]) if "layers" in k else -1)
+        _RLOG["f"].write(struct.pack("<HH", 0xA55B, len(lay)) + np.asarray(lay, np.int16).tobytes())
+    sl, topk = _RLOG["sl"], rs._S.topk
+    s = _RLOG["a"][:, sl.ny:sl.ny + R * topk * 8].copy().view(np.int64).reshape(sl.n, R, topk)
+    _RLOG["f"].write(struct.pack("<HHH", 0xA55A, sl.n, R) + s.astype(np.int16).tobytes())
+
+
 def slot_view(m):
     """layer m's GB300-side slot views (y / s / w host-mapped tensors, issue / done flag pointers)"""
     return get().slots.views[rs._S.g.index][m._gslot]

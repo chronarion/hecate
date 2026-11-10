@@ -34,3 +34,22 @@ This follows the local-inference-lab rtx6kpro protocol.
 - `bench/kvtier.py`: the system-RAM KV tier: a long document with planted facts is pushed out of the GPU pool and
   asked about again (needs `HECATE_SYSMEM_KV_GB` > 0 to come back fast).
 - The community benchmark (`llm-inference-bench`) invocations are in `bench/llm_inference_bench.sh`.
+- `bench/specmix.py`: decode speed and draft acceptance on everyday workloads at the sampling clients send (default
+  temperature 1.0): reasoning, code, long-context questions, multi-turn tool use over a small repository, file edits,
+  and general chat; reports tokens per decode step from the usage block's draft counts.
+- `bench/incprefill.py`: time to first token when a cached conversation grows by 500-8,000 new tokens.
+
+## Expert placement from routing statistics
+
+- `EXL3_ROUTE_LOG=FILE` (server environment): appends every decode step's expert selection per layer (read from the
+  band mailboxes, no extra GPU work).
+- `placement/route_stats.py`: per-band load from such a log, the band-race model for RTX copies of cold experts, and
+  `--write-copies` (each layer's cold experts ranked by use).
+- `placement/rerank_placement.py`: re-ranks which int4 experts sit in HBM and which on the Grace from one or more logs
+  (weighted), keeping the RTX band as it is; the result needs a KLD check (the Grace computes with 8-bit activations).
+
+## Kernel tests
+
+- `dev/test_draft_couple.py`: the draft head's sampling noise against ExLlamaV3's sampler, bit for bit.
+- `dev/test_grace_picks.py`: Grace band jobs with up to 20 distinct cold picks against their one-pick jobs summed in
+  pick order, bit for bit (until 1.9 the band skipped picks past the 8th)..

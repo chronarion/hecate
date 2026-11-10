@@ -37,29 +37,33 @@ llm-decode-bench v0.8.0
 │ concurrency and passed warmup. Use this as the main tuning/regression signal │
 │ for kernels, NCCL, DCP, MTP, and scheduler changes.                          │
 ╰──────────────────────────────────────────────────────────────────────────────╯
-Aggregate tok/s  + TTFT/ITL                                      
-╭────────────┬───────┬────────┬───────┬───────┬────────┬────────╮
-│ ctx \ conc │     1 │      2 │     4 │     8 │     16 │     32 │
-├────────────┼───────┼────────┼───────┼───────┼────────┼────────┤
-│ 0          │ 178.2 │  220.9 │ 124.6 │ 261.2 │  155.3 │  256.2 │
-│            │  69/7 │ 138/20 │ 2k/31 │ 1k/30 │ 2k/123 │ 3k/172 │
-╰────────────┴───────┴────────┴───────┴───────┴────────┴────────╯
+Aggregate tok/s  + TTFT/ITL                                              
+╭────────────┬───────┬────────┬────────┬────────┬───────────┬───────────╮
+│ ctx \ conc │     1 │      2 │      4 │      8 │        16 │        32 │
+├────────────┼───────┼────────┼────────┼────────┼───────────┼───────────┤
+│ 0          │ 166.4 │  208.9 │  117.0 │  246.9 │ ∅ (0/16)* │ ∅ (0/32)* │
+│            │ 103/8 │ 187/21 │ 262/34 │ 540/31 │    37k/32 │    36k/32 │
+╰────────────┴───────┴────────┴────────┴────────┴───────────┴───────────╯
 Sustained Decode: aggregate tok/s uses OpenAI stream usage by default 
 (continuous completion_tokens when the server supports it). Prometheus is kept 
 as validation/scheduler data.
 Aggregate source(s): openai_continuous_usage, openai_stream_chunks_fallback
-Per-Request tok/s                                       
-╭────────────┬───────┬───────┬──────┬──────┬─────┬─────╮
-│ ctx \ conc │     1 │     2 │    4 │    8 │  16 │  32 │
-├────────────┼───────┼───────┼──────┼──────┼─────┼─────┤
-│ 0          │ 178.2 │ 110.5 │ 31.1 │ 32.6 │ 9.7 │ 8.0 │
-╰────────────┴───────┴───────┴──────┴──────┴─────┴─────╯
-Client request latency: p50 / p90 ms                              
-╭────────────┬─────────────┬─────────────┬─────┬─────┬─────┬─────╮
-│ ctx \ conc │           1 │           2 │   4 │   8 │  16 │  32 │
-├────────────┼─────────────┼─────────────┼─────┼─────┼─────┼─────┤
-│ 0          │ 14.2k/14.3k │ 23.7k/24.0k │ —/— │ —/— │ —/— │ —/— │
-╰────────────┴─────────────┴─────────────┴─────┴─────┴─────┴─────╯
+∅ = skipped/hidden because the cell does not fit in KV cache; exact deficit is 
+kept in JSON timeout_reason
+(X/Y) = avg running / requested concurrency from Prometheus; * = 
+capacity-limited or warmup timed out
+Per-Request tok/s                                                   
+╭────────────┬───────┬───────┬──────┬──────┬───────────┬───────────╮
+│ ctx \ conc │     1 │     2 │    4 │    8 │        16 │        32 │
+├────────────┼───────┼───────┼──────┼──────┼───────────┼───────────┤
+│ 0          │ 166.4 │ 104.4 │ 29.3 │ 30.9 │ ∅ (0/16)* │ ∅ (0/32)* │
+╰────────────┴───────┴───────┴──────┴──────┴───────────┴───────────╯
+Client request latency: p50 / p90 ms                                            
+╭────────────┬─────────────┬─────────────┬─────┬────┬─────────────┬────────────╮
+│ ctx \ conc │           1 │           2 │   4 │  8 │          16 │         32 │
+├────────────┼─────────────┼─────────────┼─────┼────┼─────────────┼────────────┤
+│ 0          │ 15.1k/15.4k │ 24.2k/24.9k │ —/— │ —… │ 72.7k/72.7k │ 71.9k/71.… │
+╰────────────┴─────────────┴─────────────┴─────┴────┴─────────────┴────────────╯
 Aggregate cells show dim detail as TTFT ms / ITL ms for the same ctx/conc 
 coordinate. ITL is computed from observed generated tokens, including streams 
 stopped at the measurement boundary; a missing ITL means no stream produced at 
@@ -81,11 +85,11 @@ ITL=(last_token_time-first_token_time)/(output_tokens-1), user tok/s=1/ITL.
 │ Primary matrices repeated last so the important numbers are visible without  │
 │ scrolling back through diagnostics.                                          │
 ╰──────────────────────────────────────────────────────────────────────────────╯
-Aggregate decode tok/s                                        
-╭────────────┬───────┬───────┬───────┬───────┬───────┬───────╮
-│ ctx \ conc │     1 │     2 │     4 │     8 │    16 │    32 │
-├────────────┼───────┼───────┼───────┼───────┼───────┼───────┤
-│ 0          │ 178.2 │ 220.9 │ 124.6 │ 261.2 │ 155.3 │ 256.2 │
-╰────────────┴───────┴───────┴───────┴───────┴───────┴───────╯
+Aggregate decode tok/s                                                
+╭────────────┬───────┬───────┬───────┬───────┬───────────┬───────────╮
+│ ctx \ conc │     1 │     2 │     4 │     8 │        16 │        32 │
+├────────────┼───────┼───────┼───────┼───────┼───────────┼───────────┤
+│ 0          │ 166.4 │ 208.9 │ 117.0 │ 246.9 │ ∅ (0/16)* │ ∅ (0/32)* │
+╰────────────┴───────┴───────┴───────┴───────┴───────────┴───────────╯
 
 Results saved to /out/decode.json

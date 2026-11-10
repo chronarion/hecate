@@ -24,12 +24,17 @@ services:
       HECATE_CACHE_TOKENS: ${HECATE_CACHE_TOKENS:-524288}
       HECATE_CACHE_MODE: ${HECATE_CACHE_MODE:-Q6}
       HECATE_DRAFTS: ${HECATE_DRAFTS:-3}
-      # system-RAM tier behind the KV pool, in GB (0 = off; docs/configuration.md, "System-RAM KV tier")
-      HECATE_SYSMEM_KV_GB: ${HECATE_SYSMEM_KV_GB:-0}
+      # concurrency: at most this many requests decode at once, the rest queue (docs/configuration.md, "Concurrency");
+      # streamed requests start first and batch (non-streamed) ones leave HECATE_INTERACTIVE_RESERVE slots free
+      HECATE_MAX_BATCH: ${HECATE_MAX_BATCH:-8}
+      HECATE_INTERACTIVE_RESERVE: ${HECATE_INTERACTIVE_RESERVE:-2}
+      HECATE_PRIORITY: ${HECATE_PRIORITY:-stream}
+      # system-RAM tier behind the KV pool, in GB (default 200; 0 = off; docs/configuration.md, "System-RAM KV tier")
+      HECATE_SYSMEM_KV_GB: ${HECATE_SYSMEM_KV_GB:-200}
       HECATE_MODEL_DIR: /weights
       HECATE_MODEL_NAME: base
-      EXL3_TIER_SPLIT: /weights/placement/${HECATE_PLACEMENT:-tier-144-85-far27-mtp256}.json
-      EXL3_RTX_SPLIT: /weights/placement/${HECATE_PLACEMENT:-tier-144-85-far27-mtp256}.json
+      EXL3_TIER_SPLIT: /weights/placement/${HECATE_PLACEMENT:-tier-144-85-far27-mtp256-r2}.json
+      EXL3_RTX_SPLIT: /weights/placement/${HECATE_PLACEMENT:-tier-144-85-far27-mtp256-r2}.json
       EXL3_TIER_U4: /weights/int4
       EXL3_I8_SRC: /weights/int8
       EXL3_TENSOR_OVERRIDE: /weights/rtx-band

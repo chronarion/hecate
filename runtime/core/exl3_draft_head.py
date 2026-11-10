@@ -3,7 +3,14 @@ head). One kernel computes the logits of up to 8 rows and their argmax: every wa
 no scratch), scales its rows, reduces the per-row maximum across its lanes and posts it with a 64-bit atomicMax
 (ordered float bits << 32 | ~row, so ties pick the lower id); a second tiny kernel decodes the ids and clears the keys.
 The copy is built from the stock int8 head at the first draft call: per-row MSE-optimal uniform int4 (code - 8, fp32
-scale), packed in the moe4 fragment order ([64-row group][64-wide k-block][strip][lane] x 16 bytes). ~0.48 GB of HBM."""
+scale), packed in the moe4 fragment order ([64-row group][64-wide k-block][strip][lane] x 16 bytes). ~0.48 GB of HBM.
+
+EXL3_DRAFT_COUPLE=1 (coupled drafts): for a row whose request samples (temperature > 0), the kernel adds to each draft logit
+(scaled by 1 / T) the same Gumbel noise the target's sampler will add at that position (ExLlamaV3 samples as
+argmax(l / T + g), g from Philox keyed on the request's per-position random word and the token id), so the draft is a
+sample of the draft distribution coupled to the target's sample. The target's sampling is untouched, so the output
+(text and seed mapping) is exactly what it was; only which drafts match changes. The generator stages each row's words
+for the step's draft passes (stage()) before the passes run; rows without staged noise draft by argmax as before."""
 import os
 import torch
 
@@ -11,8 +18,10 @@ _K_SRC = r"""
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_fp16.h>
+#include <curand_kernel.h>
 namespace {
 constexpr int SPW = 4, WPB = 8, PD = 2;
+constexpr int NZ_IT = 64;     // coupled-draft buffer: int32 [8 passes][8 rows] random words, then fp32 [8] inverse temps
 __device__ __forceinline__ void mma16816(float* c, const uint32_t* a, uint32_t b0, uint32_t b1)
 {
     asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -36,14 +45,28 @@ __device__ __forceinline__ unsigned long long key_of(float v, int row)
     u = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
     return ((unsigned long long) u << 32) | (unsigned long long) (0xFFFFFFFFu - (unsigned) row);
 }
+// the target sampler's noise for token `idx` under random word `seed` (exllamav3 gumbel.cu / sampling_fused.cu, one row)
+__device__ __forceinline__ float gumbel_of(uint32_t seed, uint32_t idx)
+{
+    curandStatePhilox4_32_10_t st;
+    curand_init((unsigned long long) seed, (unsigned long long) idx, 0, &st);
+    float x = curand_uniform(&st);
+    x = fminf(x, 0.99999994f);
+    return -__logf(fmaxf(-__logf(fmaxf(x, 1e-20f)), 1e-20f));
+}
 __global__ void __launch_bounds__(WPB * 32) head_i4_argmax_kernel(const uint4* __restrict__ w, const float* __restrict__ scale,
-    const half* __restrict__ x, unsigned long long* keys, int M, int N, int K, int V)
+    const half* __restrict__ x, unsigned long long* keys, int M, int N, int K, int V,
+    const uint32_t* __restrict__ nz_rnd, const float* __restrict__ nz_it)
 {
     const int lane = threadIdx.x % 32, KB = K / 64, groups = N / (16 * SPW);
     const int nw = gridDim.x * WPB;
     const int xn = lane / 4, kq = (lane % 4) * 2; const bool live = xn < M;
     const uint32_t* xr = (const uint32_t*) (x + (size_t) (live ? xn : 0) * K + kq);
     const int col = (lane % 4) * 2;
+    // coupled drafts: inverse temperature and random word of batch rows col and col + 1 (0: argmax, no noise)
+    const float it0 = (nz_it != nullptr && col < M) ? nz_it[col] : 0.f;
+    const float it1 = (nz_it != nullptr && col + 1 < M) ? nz_it[col + 1] : 0.f;
+    const uint32_t rn0 = it0 > 0.f ? nz_rnd[col] : 0u, rn1 = it1 > 0.f ? nz_rnd[col + 1] : 0u;
     for (int g = blockIdx.x * WPB + threadIdx.x / 32; g < groups; g += nw)
     {
         const uint4* base = w + (size_t) g * KB * 32 * SPW + lane;
@@ -86,8 +109,11 @@ __global__ void __launch_bounds__(WPB * 32) head_i4_argmax_kernel(const uint4* _
         {
             const int r0 = g * SPW * 16 + s * 16 + lane / 4, r1 = r0 + 8;
             const float s0 = scale[r0], s1 = scale[r1];
-            if (r0 < V) { b0 = max(b0, key_of(c[s][0] * s0, r0)); b1 = max(b1, key_of(c[s][1] * s0, r0)); }
-            if (r1 < V) { b0 = max(b0, key_of(c[s][2] * s1, r1)); b1 = max(b1, key_of(c[s][3] * s1, r1)); }
+            float v00 = c[s][0] * s0, v01 = c[s][1] * s0, v10 = c[s][2] * s1, v11 = c[s][3] * s1;
+            if (it0 > 0.f) { v00 = v00 * it0 + gumbel_of(rn0, r0); v10 = v10 * it0 + gumbel_of(rn0, r1); }
+            if (it1 > 0.f) { v01 = v01 * it1 + gumbel_of(rn1, r0); v11 = v11 * it1 + gumbel_of(rn1, r1); }
+            if (r0 < V) { b0 = max(b0, key_of(v00, r0)); b1 = max(b1, key_of(v01, r0)); }
+            if (r1 < V) { b0 = max(b0, key_of(v10, r1)); b1 = max(b1, key_of(v11, r1)); }
         }
         #pragma unroll
         for (int o = 4; o < 32; o <<= 1)
@@ -109,7 +135,8 @@ __global__ void head_i4_decode_kernel(unsigned long long* keys, int64_t* ids, in
 }
 }  // namespace
 
-void head_i4_argmax(at::Tensor w, at::Tensor scale, at::Tensor x, at::Tensor keys, at::Tensor ids, int64_t N, int64_t V)
+void head_i4_argmax(at::Tensor w, at::Tensor scale, at::Tensor x, at::Tensor keys, at::Tensor ids, int64_t N, int64_t V,
+    at::Tensor nz, int64_t step)
 {
     const int K = (int) x.size(-1), M = (int) (x.numel() / K);
     TORCH_CHECK(M >= 1 && M <= 8 && K % 64 == 0 && N % 64 == 0 && x.dtype() == at::kHalf && x.is_contiguous(), "head_i4: shape");
@@ -117,13 +144,18 @@ void head_i4_argmax(at::Tensor w, at::Tensor scale, at::Tensor x, at::Tensor key
     const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
     const int groups = (int) (N / 64), blocks = std::min((groups + WPB - 1) / WPB, sms * 2);
     head_i4_argmax_kernel<<<blocks, WPB * 32, 0, st>>>((const uint4*) w.data_ptr(), (const float*) scale.data_ptr(),
-        (const half*) x.data_ptr(), (unsigned long long*) keys.data_ptr(), M, (int) N, K, (int) V);
+        (const half*) x.data_ptr(), (unsigned long long*) keys.data_ptr(), M, (int) N, K, (int) V,
+        nz.numel() ? (const uint32_t*) nz.data_ptr<int>() + step * 8 : nullptr,
+        nz.numel() ? (const float*) (nz.data_ptr<int>() + NZ_IT) : nullptr);
     head_i4_decode_kernel<<<1, 32, 0, st>>>((unsigned long long*) keys.data_ptr(), ids.data_ptr<int64_t>(), M);
 }
 """
 
 _ext = None
 _HEAD = {}
+COUPLE = os.environ.get("EXL3_DRAFT_COUPLE", "0") == "1"
+_NZ = {}          # device -> coupled-draft noise buffer and its pinned staging ring
+_EMPTY = {}
 _U4F = (2.4, 2.6, 2.8, 3.0, 3.2, 3.4, 3.7, 4.0)
 
 
@@ -132,7 +164,7 @@ def _ext_mod():
     if _ext is None:
         from torch.utils.cpp_extension import load_inline
         bd = os.path.join(os.environ.get("EXL3_TIER_BUILD", "/tmp"), "build_draft_head"); os.makedirs(bd, exist_ok=True)
-        _ext = load_inline(name="exl3_draft_head_i4", cpp_sources="void head_i4_argmax(at::Tensor w, at::Tensor scale, at::Tensor x, at::Tensor keys, at::Tensor ids, int64_t N, int64_t V);",
+        _ext = load_inline(name="exl3_draft_head_i4", cpp_sources="void head_i4_argmax(at::Tensor w, at::Tensor scale, at::Tensor x, at::Tensor keys, at::Tensor ids, int64_t N, int64_t V, at::Tensor nz, int64_t step);",
                            cuda_sources=_K_SRC, functions=["head_i4_argmax"], build_directory=bd,
                            extra_cuda_cflags=["-O3", "-gencode=arch=compute_103a,code=sm_103a"])
     return _ext
@@ -177,15 +209,62 @@ def build(lm):
     return {"w": w, "scale": scale, "keys": keys, "ids": ids, "N": N, "dev": dev}
 
 
-def argmax(lm, x2d, V):
+def _nz(dev):
+    """the device noise buffer (fixed address, so captured draft graphs read whatever was staged before their replay):
+    int32 [8 passes][8 rows] random words + fp32 [8] inverse temperatures (0: argmax), and a ring of pinned copies"""
+    nz = _NZ.get(dev)
+    if nz is None:
+        nz = _NZ[dev] = {"dev": torch.zeros(72, dtype=torch.int32, device=dev),
+                         "ring": [(torch.zeros(72, dtype=torch.int32).pin_memory(), None) for _ in range(4)], "k": 0,
+                         "live": False}
+    return nz
+
+
+def stage(rows, dev=None):
+    """coupled drafts: rows[b] = (random words for the step's draft passes, inverse temperature) or None (argmax) for
+    batch row b; queued on the current stream ahead of the draft passes"""
+    dev = dev or torch.device("cuda", torch.cuda.current_device())
+    nz = _nz(dev)
+    live = any(r is not None for r in rows)
+    if not live and not nz["live"]:
+        return
+    k = nz["k"]; nz["k"] = (k + 1) % len(nz["ring"])
+    pin, ev = nz["ring"][k]
+    if ev is not None:
+        ev.synchronize()
+    h = pin.numpy()
+    h[:] = 0
+    itv = h[64:72].view("float32")
+    for b, r in enumerate(rows[:8]):
+        if r is None:
+            continue
+        words, it = r
+        for p, wd in enumerate(words[:8]):
+            h[p * 8 + b] = wd - (1 << 32) if wd >= (1 << 31) else wd
+        itv[b] = it
+    nz["dev"].copy_(pin, non_blocking=True)
+    ev = torch.cuda.Event(); ev.record()
+    nz["ring"][k] = (pin, ev)
+    nz["live"] = live
+
+
+def argmax(lm, x2d, V, step=0):
     h = _HEAD.get(id(lm))
     if h is None:
         h = _HEAD[id(lm)] = build(lm)
-        print(f" -- draft head: int4 copy of the LM head, {h['w'].numel() / 1e9:.2f} GB", flush=True)
+        print(f" -- draft head: int4 copy of the LM head, {h['w'].numel() / 1e9:.2f} GB"
+              + (", coupled drafts (EXL3_DRAFT_COUPLE)" if COUPLE else ""), flush=True)
     M = x2d.shape[0]
     # a fresh id tensor per call: the generator keeps every draft column and concatenates them after the last pass
     ids = torch.empty(M, dtype=torch.int64, device=x2d.device)
-    _ext_mod().head_i4_argmax(h["w"], h["scale"], x2d, h["keys"], ids, h["N"], V)
+    if COUPLE and 0 <= step < 8:
+        nz = _nz(x2d.device)["dev"]
+    else:
+        nz = _EMPTY.get(x2d.device)
+        if nz is None:
+            nz = _EMPTY[x2d.device] = torch.zeros(0, dtype=torch.int32, device=x2d.device)
+        step = 0
+    _ext_mod().head_i4_argmax(h["w"], h["scale"], x2d, h["keys"], ids, h["N"], V, nz, int(step))
     return ids
 
 
@@ -206,7 +285,7 @@ def install():
             return _o(self, state, params)
         if x2.dtype != torch.half or not x2.is_contiguous():
             x2 = x2.half().contiguous()
-        ids = argmax(lm, x2, tgt.config.vocab_size)
+        ids = argmax(lm, x2, tgt.config.vocab_size, int(params.get("draft_step", 0) or 0))
         return ids.view(*state.shape[:-1])
     GlmMoeDsaMTPModel.sample_from_state = sample_from_state
     print(" -- hecate: int4 draft LM head (EXL3_DRAFT_HEAD_I4)", flush=True)

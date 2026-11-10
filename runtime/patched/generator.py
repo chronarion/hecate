@@ -15,6 +15,29 @@ _PF_SHARE = min(0.9, max(0.0, float(os.environ.get("EXL3_PREFILL_DECODE_SHARE", 
 _MTP_MERGE = os.environ.get("EXL3_MTP_MERGE_GAP", "0") == "1"
 
 
+def _sampler_itemp(sampler) -> float:
+    """hecate (coupled drafts): 1 / T of a sampler whose last step is a Gumbel sample of softmax(l / T) (ExLlamaV3's fused
+    tail or SS_Sample), else 0 (greedy or another sampling rule: drafts stay argmax)"""
+    v = getattr(sampler, "_hecate_itemp", None)
+    if v is not None:
+        return v
+    v = 0.0
+    steps = getattr(sampler, "steps", None) or []
+    last = type(steps[-1]).__name__ if steps else ""
+    if last == "SS_Fused":
+        v = float(steps[-1].inv_temp) if steps[-1].mode != 0 else 0.0
+    elif last == "SS_Sample":
+        v = 1.0
+        for s in steps:
+            if type(s).__name__ == "SS_Temperature":
+                v = 1.0 / s.temperature if s.temperature > 0 else 0.0
+    try:
+        sampler._hecate_itemp = v
+    except Exception:
+        pass
+    return v
+
+
 def _pad_pages(p):
     return p if (_BT_FINE and p <= 16) else (p + 15) // 16 * 16
 from ..util import cuda_sync_active
@@ -42,6 +65,13 @@ from ..util import profile_opt
 _NO_BATCH_READBACK = False
 
 _PRELAUNCH = os.environ.get("EXL3_PRELAUNCH", "1") == "1"   # hecate: pipelined MTP decode step
+# hecate (copy drafts): when the newest tokens repeat at least EXL3_COPY_MIN tokens of earlier context, verify the up to
+# EXL3_COPY_MAX tokens that followed that earlier occurrence instead of the MTP drafts (one decoding job)
+_COPY = os.environ.get("EXL3_COPY_DRAFT", "0") == "1"
+_ROUTE_LOG = bool(os.environ.get("EXL3_ROUTE_LOG"))
+_RESERVE = int(os.environ.get("HECATE_INTERACTIVE_RESERVE", "2") or 0)   # hecate: batch slots kept free for interactive jobs   # hecate: decode routing log for placement statistics
+_COPY_MIN = int(os.environ.get("EXL3_COPY_MIN", "16"))
+_COPY_MAX = int(os.environ.get("EXL3_COPY_MAX", "7"))
 
 
 class Generator:
@@ -451,6 +481,8 @@ class Generator:
         # Sparse drafting head over a frequency-selected vocabulary subset (layer-split mode only)
         self.sparse_head = None
         self._sparse_flag = False
+        import random as _random
+        self._couple_rng = _random.Random()
         if sparse_draft_head and self.draft_model is not None and not model.loaded_tp:
             from ..modules.sparse_head import token_stats_path
             # Drafters with a head of their own (Gemma4 assistant) take the subset there; the others borrow the
@@ -649,6 +681,10 @@ class Generator:
 
         job.prepare_for_queue(self, self.job_serial)
         self.job_serial += 1
+        # hecate (concurrency): the request's class from the server's task-local tag (0 interactive, 1 batch)
+        rt = __import__("sys").modules.get("hecate_runtime")
+        tag = rt.REQUEST.get() if rt is not None and hasattr(rt, "REQUEST") else None
+        job.hecate_cls = tag["cls"] if tag else 0
         self.pending_jobs.append(job)
         if self.disk_page_cache is not None:
             # Start reading the prompt's pages that only the disk tier holds, so the allocation finds them in
@@ -841,6 +877,14 @@ class Generator:
         # Regular generation
         else:
             draft_tokens = None
+
+        # hecate (copy drafts): one decoding job whose newest tokens repeat earlier context verifies the continuation
+        if _COPY and pre is None and draft_tokens is not None and draft_tokens.shape[0] == 1:
+            jobs_d = [job for job in self.active_jobs if job.is_prefill_done()]
+            if len(jobs_d) == 1:
+                c = self._copy_draft(jobs_d[0])
+                if c is not None:
+                    draft_tokens = c
 
         # Long suffix-match draft over the regular one, when a job is repeating its context
         if self.hybrid_draft_tokens:
@@ -1273,6 +1317,7 @@ class Generator:
             kv_seqlens = cache_seqlens.clone()
             target_states = [job.recurrent_state.target for job in self.active_jobs if job.is_prefill_done()] \
                 if self.target_recurrent else None
+        self._couple_stage([(job, None, 0) for job in self.active_jobs if job.is_prefill_done()], window)
         _vg = __import__("sys").modules.get("exl3_vgraph")
         if _vg is not None and _vg.DRAFT and not target_kv and cal is None and self.sparse_head is None:
             _r = _vg.draft_graph(self, batch_size, block_index, cache_seqlens, batch_ids, temp_hidden, gap, window)
@@ -1660,6 +1705,54 @@ class Generator:
         params["dev_cache"] = dev_cache
 
 
+    def _couple_stage(self, entries, window: int):
+        """hecate (coupled drafts, EXL3_DRAFT_COUPLE): for each drafting row, the random words the job's sampler will draw
+        for the step's first `window` verify positions, so the draft head adds the same Gumbel noise to its logits.
+        entries: (job, rng state at the start of the step's sampling or None for the job's RNG now, draws to skip)"""
+        dh = __import__("sys").modules.get("exl3_draft_head")
+        if dh is None or not dh.COUPLE:
+            return
+        rows = []
+        for job, state, skip in entries:
+            it = _sampler_itemp(job.sampler)
+            if it <= 0.0 or job.forced_ids is not None:
+                rows.append(None)
+                continue
+            r = self._couple_rng
+            r.setstate(job.rng.getstate() if state is None else state)
+            for _ in range(skip):
+                r.randint(0, (1 << 32) - 1)
+            rows.append(([r.randint(0, (1 << 32) - 1) for _ in range(window)], it))
+        dh.stage(rows)
+
+    def _copy_draft(self, job, extra = None, limit = None):
+        """hecate (copy drafts): the continuation of the longest earlier occurrence of the job's newest tokens (`extra`:
+        tokens sampled this step, not yet appended), as a pinned (1, L) tensor, or None below EXL3_COPY_MIN matched tokens"""
+        if not _COPY or len(job.sequences) != 1:
+            return None
+        seq = job.sequences[0].sequence_ids.torch()
+        if extra is not None and len(extra):
+            seq = torch.cat((seq, torch.tensor([extra], dtype = torch.long)), dim = -1)
+        sam = getattr(job, "_copy_sam", None)
+        if sam is None:
+            sam = job._copy_sam = ext.BC_SAM()
+        beg, end = sam.accept_tensor(seq.contiguous())
+        if end - beg < _COPY_MIN:
+            return None
+        L = min(_COPY_MAX, (limit if limit is not None else _COPY_MAX), max(0, self.draft_max_rows - 1) or _COPY_MAX,
+                seq.shape[-1] - end, job.max_new_tokens - job.new_tokens - (len(extra) if extra is not None else 0) - 2)
+        if L < 1:
+            return None
+        buf = getattr(self, "_copy_pinned", None)
+        if buf is None:
+            buf = self._copy_pinned = [torch.zeros((1, 8), dtype = torch.long, pin_memory = True) for _ in range(2)]
+            self._copy_k = 0
+        self._copy_k ^= 1
+        out = buf[self._copy_k][:, :L]
+        out.copy_(seq[:, end:end + L])
+        self._copy_stats = getattr(self, "_copy_stats", 0) + 1
+        return out
+
     def _mtp_flush_gaps(self):
         # write stashed MTP gaps (EXL3_MTP_MERGE_GAP) the way the verify round would have
         for job in self.active_jobs:
@@ -1692,7 +1785,7 @@ class Generator:
             print(f" -- hecate prelaunch: {self._pre_stats}", flush = True)
         return pre
 
-    def _prelaunch_fast(self, job, staged, draft_tokens, batch_ids, p_export_states, W):
+    def _prelaunch_fast(self, job, staged, draft_tokens, batch_ids, p_export_states, W, rng_state = None):
         """hecate (prelaunch): the single decoding job's next step from this step's sampled tokens, before the
         per-token bookkeeping; the staging of _prelaunch_next, written from the post-acceptance state"""
         if not hasattr(self, "_pre_stats"):
@@ -1739,13 +1832,26 @@ class Generator:
         dsl[0] = kv_new
         bids = self.draft_input_ids_pinned[:1, :]
         bids.fill_(vals[n_acc - 1])
+        self._couple_stage([(job, rng_state, n_acc)], window)
         d = vg.draft_graph(self, 1, dbi, dsl, bids, temp_hidden, gap, window, defer = True)
         if d is None:
             self._pre_stats["skip"] += 1
             return
         pre = {"job": job, "kvp": kv_new, "draft_pinned": d["pinned"], "event": d["event"], "logits": None,
                "fast": True}
-        mpb = _pad_pages((base_len + window + window + PAGE_SIZE - 1) // PAGE_SIZE)
+        # hecate (copy drafts): the verify takes the copied continuation instead of the MTP drafts (the draft passes
+        # above still write the draft cache's rows for the accepted gap)
+        vdev = d["dev"]
+        copy = self._copy_draft(job, vals[:n_acc]) if _COPY else None
+        if copy is not None:
+            cdev = getattr(self, "_copy_dev", None)
+            if cdev is None:
+                cdev = self._copy_dev = torch.zeros((1, 8), dtype = torch.long, device = d["dev"].device)
+            vdev = cdev[:, :copy.shape[-1]]
+            vdev.copy_(copy, non_blocking = True)
+            pre["draft_pinned"] = copy
+        wv = max(window, vdev.shape[-1])
+        mpb = _pad_pages((base_len + wv + wv + PAGE_SIZE - 1) // PAGE_SIZE)
         use_offsets = "mrope" in self.model.caps
         arena = self._stage_arena(1, mpb, use_offsets)
         blk, csl, pos = arena[1]
@@ -1772,7 +1878,7 @@ class Generator:
             tok = self._pre_tok = torch.empty((1, 1), dtype = torch.long, pin_memory = True)
         tok.fill_(vals[n_acc - 1])
         p2 = {k: v_ for k, v_ in params.items() if k != "indexed_embeddings"}
-        logits = vg.verify_prelaunch(self.model, tok, d["dev"], p2)
+        logits = vg.verify_prelaunch(self.model, tok, vdev, p2)
         if logits is not None:
             pre.update(logits = logits, params = {**p2, "indexed_embeddings": job.embeddings}, arena = arena,
                        max_pages_batch = mpb)
@@ -1825,6 +1931,7 @@ class Generator:
                 gap = gp; job.mtp_gap = None
             else:
                 self._mtp_flush_gaps()
+        self._couple_stage([(job, None, 0)], window)
         d = vg.draft_graph(self, 1, block_index, cache_seqlens, batch_ids, temp_hidden, gap, window, defer = True)
         if d is None:
             if gap is not None:
@@ -1832,6 +1939,16 @@ class Generator:
             self._pre_stats["skip"] += 1
             return
         pre = {"job": job, "kvp": seq.kv_position, "draft_pinned": d["pinned"], "event": d["event"], "logits": None}
+        vdev = d["dev"]
+        copy = self._copy_draft(job) if _COPY else None
+        if copy is not None:
+            cdev = getattr(self, "_copy_dev", None)
+            if cdev is None:
+                cdev = self._copy_dev = torch.zeros((1, 8), dtype = torch.long, device = d["dev"].device)
+            vdev = cdev[:, :copy.shape[-1]]
+            vdev.copy_(copy, non_blocking = True)
+            pre["draft_pinned"] = copy
+        window = max(window, vdev.shape[-1])
         # verify: as iterate_gen's staging for one job with a draft window
         msl = job.get_max_seq_len() + window + window
         mpb = _pad_pages((msl + PAGE_SIZE - 1) // PAGE_SIZE)
@@ -1861,7 +1978,7 @@ class Generator:
             tok = self._pre_tok = torch.empty((1, 1), dtype = torch.long, pin_memory = True)
         tok.copy_(last)
         p2 = {k: v_ for k, v_ in params.items() if k != "indexed_embeddings"}
-        logits = vg.verify_prelaunch(self.model, tok, d["dev"], p2)
+        logits = vg.verify_prelaunch(self.model, tok, vdev, p2)
         if logits is not None:
             pre.update(logits = logits, params = {**p2, "indexed_embeddings": job.embeddings}, arena = arena,
                        max_pages_batch = mpb)
@@ -2169,6 +2286,10 @@ class Generator:
                                 pinned_w[0:1, i:i + 1].copy_(sampled[0].view(1, 1), non_blocking = True)
                                 staged[i] = ((pinned_w[0:1, i:i + 1],) + sampled[1:], False)
                         torch.cuda.synchronize(batch_logits.device)
+                    if _ROUTE_LOG and len(self.active_jobs) == 1:
+                        _rg = __import__("sys").modules.get("rtx_graph")
+                        if _rg is not None:
+                            _rg.log_routing(W)
                     # hecate (prelaunch): the accepted count is known here; launch the next step's drafts and
                     # verify before the per-token bookkeeping below. The step's tables it reads later are snapshotted
                     # first, since the prelaunch restages the shared pinned buffers
@@ -2177,7 +2298,7 @@ class Generator:
                         draft_tokens = draft_tokens.clone()
                         block_index = block_index.clone()
                         p_cache_seqlens = p_cache_seqlens.clone() if p_cache_seqlens is not None else None
-                        self._prelaunch_fast(job, staged, draft_tokens, batch_ids, p_export_states, W)
+                        self._prelaunch_fast(job, staged, draft_tokens, batch_ids, p_export_states, W, rng_state)
 
                 for i in range(W):
                     positions_used = i + 1
@@ -2475,14 +2596,23 @@ class Generator:
         for job in self.active_jobs:
             current_max_batch += len(job.sequences)
 
+        # hecate (concurrency): interactive jobs (streamed requests) are considered first, and batch jobs may fill only
+        # max_batch_size - HECATE_INTERACTIVE_RESERVE slots, so an agent's or a chat's turn starts at once under batch
+        # load. A batch job held back by that limit waits without counting a skip (the skip guard below is for jobs
+        # that do not fit in the batch or the cache)
+        batch_rows = sum(len(j.sequences) for j in self.active_jobs if getattr(j, "hecate_cls", 0) == 1)
+        reserve = min(_RESERVE, max(0, self.max_batch_size - 1))
+
         # Start new jobs if possible
         if (self.pagetable.num_unreferenced_pages() and
             len(self.pending_jobs) and
             current_max_batch < self.max_batch_size):
 
             skipped_jobs = []
-            for job in self.pending_jobs.copy():
+            for job in sorted(self.pending_jobs, key = lambda j: getattr(j, "hecate_cls", 0)):
 
+                if getattr(job, "hecate_cls", 0) == 1 and batch_rows + len(job.sequences) > self.max_batch_size - reserve:
+                    continue
                 if (len(job.sequences) + current_max_batch > self.max_batch_size or
                         job.current_new_pages_required() > self.pagetable.num_unreferenced_pages()):
                     skipped_jobs.append(job)
@@ -2507,6 +2637,8 @@ class Generator:
                     self.reap_failed_job(job, e, results)
                     continue
                 current_max_batch += len(job.sequences)
+                if getattr(job, "hecate_cls", 0) == 1:
+                    batch_rows += len(job.sequences)
 
                 r = {
                     "job": job,

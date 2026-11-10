@@ -29,8 +29,9 @@ GGUF or safetensors checkpoint.
 
 | | |
 |---|---|
-| Decode, concurrency 1 (10 prompts, greedy, MTP 3 drafts) | ~184 tok/s |
-| KL divergence vs BF16 (rtx6kpro protocol, 36,848 positions) | 0.0735 (see the benchmarks below) |
+| Decode, concurrency 1, realistic workloads (temperature 1) | 144-212 tok/s by workload |
+| Decode, concurrency 1 (10 prompts, greedy, MTP 3 drafts) | ~176 tok/s |
+| KL divergence vs BF16 (rtx6kpro protocol, 36,848 positions) | 0.0734 (see the benchmarks below) |
 | Context | 2 × 256K (Q6 KV) by default; one 1M-token conversation with the long-context profile |
 
 ## What is in this repository
@@ -45,8 +46,9 @@ GGUF or safetensors checkpoint.
 
 ## How it was made
 
-- **Placement.** Each MoE layer's experts are ranked by how often they are routed. The data is a routing log of 2,599
-  verify steps over 24 prompts.
+- **Placement.** Each MoE layer's experts are ranked by how often they are routed. Since 1.9 the data are decode
+  routing logs of ~30K verify steps over reasoning, code, long-context, tool-use, editing and chat requests
+  (`placement/tier-144-85-far27-mtp256-r2.json`); the 1.8 ranking came from 2,599 steps over 24 short prompts.
 - **int4 tiers.** GPTQ on 852K calibration tokens:
   - act-order;
   - per-expert Hessians shrunk toward the layer-wide input covariance;
@@ -70,17 +72,37 @@ Raw JSON and logs: [`benchmarks/`](https://github.com/chronarion/hecate/tree/mai
 
 | Context | C=1 | C=2 | C=4 | C=8 | C=16 | C=32 |
 |---|---:|---:|---:|---:|---:|---:|
-| 0 | 177 | 221 | 125 | 261 | 155 | 256 |
-| 4K | 161 | 170 | 124 | 271 | - | - |
-| 16K | 144 | 193 | 122 | 264 | - | - |
-| 32K | 156 | 191 | 122 | 267 | - | - |
-| 64K | 148 | 179 | 120 | - | - | - |
-| 128K | 146 | 169 | - | - | - | - |
+| 0 | 168 | 209 | 117 | 247 | 8 run + 8 queue | 8 run + 24 queue |
+| 4K | 148 | 185 | 117 | 251 | - | - |
+| 16K | 152 | 182 | 113 | 246 | - | - |
+| 32K | 156 | 172 | 115 | 247 | - | - |
+| 64K | 150 | 181 | 114 | - | - | - |
+| 128K | 146 | 172 | - | - | - | - |
 
-Each request gets the aggregate divided by C. Hecate is tuned for one or two conversations: from 4 concurrent requests
-the server trims MTP drafts to stay on the 8-row decode fast path (4: one draft, 8: none); from 16 it leaves that path.
-Past 2,048 tokens of context the model's sparse attention (DSA) takes over. Single concurrency-1 cells vary by up to
-±10% between runs, because MTP acceptance depends on the generated text.
+Each request gets the aggregate divided by C. Hecate is tuned for a few conversations: at most 8 requests decode at
+once (`HECATE_MAX_BATCH`) and later ones wait in the queue, then run at full speed: at C=16 each request decoded at ~31
+tok/s once it started, ~250 tok/s in aggregate, after waiting ~37 s on average for a slot (the benchmark's own aggregate
+for queued cells is not meaningful). MTP drafts take rows too: 4 concurrent requests get one draft each, 8 none.
+Streamed requests start ahead of non-streamed ones (see the GitHub docs, configuration, "Concurrency"). Single C=1 cells vary by up
+to ±10% between runs, because MTP acceptance depends on the generated text; on this benchmark 1.9 and 1.8 measured the
+same at C=1 in one session (the 1.9 gains show on the workloads below).
+
+On our short greedy test 1.9 is ~3% slower than 1.8 (~176 vs ~181 tok/s, means over 6 and 3 server restarts; a single
+restart moves it by ±3%). Switching the new drafts or the request scheduling off does not change it. About 1% comes from
+the new expert placement, which is ranked for real traffic rather than for this test (1.9 with the old placement: ~178);
+the rest is likely the Grace band fix, which now computes experts that were skipped before.
+
+#### Realistic workloads
+
+Measured with `tools/bench/specmix.py` (GitHub repo) at temperature 1, release 1.8 vs 1.9 in one session, decode tok/s:
+
+| Workload | 1.8 | 1.9 |
+|---|---:|---:|
+| Reasoning | 136 | 146 |
+| Code | 139 | 146 |
+| Questions about a 46K-token document | 136 | 144 |
+| Everyday chat (reasoning effort low) | 156 | 154 |
+| Agent turns with tool calls that write files, file edits | 146 | 212 |
 
 #### Prefill (llm-inference-bench standalone cold prefill, mean of 2 rounds)
 
@@ -89,10 +111,14 @@ Past 2,048 tokens of context the model's sparse attention (DSA) takes over. Sing
 | Prefill tok/s | 3,380 | 3,870 | 4,768 | 4,836 | 4,810 | 4,750 | 4,602 |
 | Time to first token | 0.3 s | 1.1 s | 1.7 s | 3.4 s | 6.7 s | 13.6 s | 28.0 s |
 
+Once the 512K-token GPU pool is full, the pages a long prompt pushes out are copied into the system-RAM conversation
+cache while it prefills, which makes prompts from 16K up ~5% slower (4,330-4,590 tok/s); with `HECATE_SYSMEM_KV_GB=0`
+they are dropped instead and prefill stays at the numbers above.
+
 #### Our speed test
 
-10 chat prompts, greedy, 400 tokens, concurrency 1: **~184 tok/s** (180.9-188.8 over the 1.8 test passes; 1.7: ~181
-in the same session). A 27K-token prompt: prefill 4,648 tok/s, then 163 tok/s decode; a 109K-token
+10 chat prompts, greedy, 400 tokens, concurrency 1: **~176 tok/s** (172-179 over 6 server restarts; 1.8: ~181 in the same
+session, see above). Release 1.8, a 27K-token prompt: prefill 4,648 tok/s, then 163 tok/s decode; a 109K-token
 prompt: prefill 4,712 tok/s, then 158 tok/s (means of 2 runs; single runs vary ±10%).
 
 #### KLD compared with other GLM-5.3 quants
@@ -108,7 +134,7 @@ group shares one exact window set.
 
 | Quant | bpw | KLD | Evaluation set |
 |---|---|---|---|
-| **Hecate** (this release) | 3.8² | **0.0735**¹ | ours: 18 windows, 36,848 positions (wiki, code, chat, math, zh, two 8K windows), verify-shape decode path |
+| **Hecate** (this release) | 3.8² | **0.0734**¹ | ours: 18 windows, 36,848 positions (wiki, code, chat, math, zh, two 8K windows), verify-shape decode path |
 | Infatoshi EXL3 3.0 bpw (scored by us) | 3.04 | 0.1013 | ours, same windows (against the BF16 of its own lineage) |
 | brandonmusic EXL3 TR3 | 3.0 | 0.0979 | 16 sealed windows, 32,752 positions |
 | vcruz305 EXL3 | 3.38 | 0.0948 | own set, 10,240 positions, 1,024-token sequences |

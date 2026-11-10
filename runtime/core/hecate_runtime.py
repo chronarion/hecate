@@ -214,6 +214,42 @@ def _hook_linear(lin):
     lin._i8_hooked = True
 
 
+# hecate (concurrency): each request's class, visible to the generator's enqueue in the same task. Streamed requests
+# (chat UIs, agents) are interactive, the rest batch; HECATE_PRIORITY=off treats every request alike (FIFO)
+import contextvars
+REQUEST = contextvars.ContextVar("hecate_request", default=None)
+
+
+def patch_tabby():
+    """wrap TabbyAPI's ExllamaV3Container.generate_gen so the job it creates is tagged with its request's class; called
+    by the entrypoint once /opt/tabbyAPI is importable, before TabbyAPI's main runs"""
+    if os.environ.get("HECATE_PRIORITY", "stream") == "off":
+        return
+    try:
+        from backends.exllamav3.model import ExllamaV3Container as C
+    except Exception as e:
+        print(f" -- hecate: requests not classified ({type(e).__name__}: {e}); FIFO admission", flush=True)
+        return
+    gg = C.generate_gen
+
+    async def generate_gen(self, request_id, prompt, params, *a, **k):
+        # the job is created and enqueued while the generator runs up to its first result: tag only that step (set and
+        # cleared in the same context; a stream can be closed later from another one)
+        agen = gg(self, request_id, prompt, params, *a, **k)
+        tok = REQUEST.set({"cls": 0 if getattr(params, "stream", False) else 1})
+        try:
+            first = await agen.__anext__()
+        except StopAsyncIteration:
+            return
+        finally:
+            REQUEST.reset(tok)
+        yield first
+        async for r in agen:
+            yield r
+    C.generate_gen = generate_gen
+    print(" -- hecate: streamed requests start ahead of non-streamed ones (HECATE_PRIORITY)", flush=True)
+
+
 def _load():
     if I8_SRC:
         _patch_linear()
