@@ -59,7 +59,22 @@ jobs, evaluations), and batch requests may only fill `HECATE_MAX_BATCH - HECATE_
 interactive turn starts within a step even when a batch client keeps the queue full. With only batch traffic the reserve
 leaves those slots idle; set `HECATE_INTERACTIVE_RESERVE=0` for a batch-only server. A gateway in front of Hecate
 should also limit each client's parallel requests and must not retry timed-out generations (the retry runs the whole
-generation again).
+generation again). A request whose client disconnects is cancelled, also while it waits in the queue.
+
+Prompts are processed one 8K chunk per scheduler pass, so a request that arrives while long prompts are being read is
+admitted within one chunk. Interactive prompts go first; batch prompts take turns, so a batch finishes its prompts together
+and starts generating as one wide step. While requests are generating, prompt processing is paced so that the generating
+requests keep a share of the GPU: `EXL3_PREFILL_DECODE_SHARE` (0.3) in general, and `HECATE_DECODE_SHARE_INTERACTIVE`
+(0.8) while an interactive request is generating and the waiting prompt belongs to a batch request, so an agent keeps its
+speed while a batch client sends long prompts. An interactive prompt starts without waiting when no other interactive
+request is generating. Measured with `tools/bench/overload_check.py --prompt-tokens 30000` (24 batch requests with
+unique 30K-token prompts, a streamed request every 45 s): agents got
+their first token within 2.0 s (1.9: up to 38 s) and decoded at 30-93 tok/s (1.9: 17-35), and the batch finished sooner
+(median 229 s, 1.9: 258 s).
+
+Streamed responses carry usage on every chunk when the request asks for `stream_options.continuous_usage_stats` (vLLM's
+extension; TabbyAPI otherwise reports usage only at the end of a request). Benchmarks that count tokens from usage, such
+as llm-inference-bench, need it to measure requests that run longer than their window.
 
 ### System-RAM KV tier
 
@@ -80,6 +95,9 @@ tokens, 8x the default pool.
 | `EXL3_VERIFY_GRAPH` / `EXL3_DRAFT_GRAPH` | 1 / 1 | decode-verify forward and MTP draft passes as CUDA graphs |
 | `EXL3_DSA_MULTIROW` / `EXL3_VERIFY_GRAPH_SPARSE` | 1 / 1 | contexts above 2,048 tokens (the DSA regime): a single conversation's sparse attention reads its scan widths and causal bounds from device state instead of host scalars, so its decode steps replay as CUDA graphs too (keyed by regime); 0 / 0 = those steps run eagerly |
 | `EXL3_MLA_KVQ` | 3 | decode attention with the quantized latent cache: one kernel does the kv_a norm, the rope key, the Q6 group quantization and the paged cache write, on a side branch of the graph that runs while the q_a norm and q_b GEMV run (the absorb kernel applies the query rope); bit-identical cache contents. 3 (default) = also the indexer-key stages of the 21 full-indexer layers on that branch, 1 = the cache append only; 0 = the separate staging, rope, quant and scatter kernels |
+| `EXL3_MLA_BLOCK_ROWS_B` | 16 | decode attention with several requests (dense regime, contexts under 2,048 tokens): each program takes 16 (row, head) pairs, as a single request's verify step does, instead of 4 heads of one row; fewer programs re-read the same cached keys. 6-8 requests at 1-1.5K tokens of context: 15-20% shorter decode steps. 0 = the 4-head block |
+| `EXL3_VERIFY_GRAPH_BATCH` / `EXL3_DRAFT_GRAPH_BATCH` / `EXL3_BATCH_ONESYNC` | 1 / 1 / 1 | decode steps of 2..8 requests replay from CUDA graphs too (one per batch size, rows per request, block-table width and attention regime; the regime is the batch's longest request), and so do the MTP draft passes of 2..4 requests; the samplers of all requests launch before one readback. Graph and eager logits agree within the eager-vs-eager noise floor (`EXL3_VERIFY_GRAPH_CHECK`). 2-4 requests: 3-5% shorter steps; 6-8 requests: 2-4% |
+| `EXL3_HMLA_BATCH` | 1 | contexts above 2,048 tokens with several requests: the tcgen05 sparse attention kernel (until now one request only) runs the whole batch, each row reading its own request's block table; bit-identical per row to one-request launches (`tools/dev/test_hmla_batch.py`). 2-8 requests at ~16K tokens of context: steps 2.7-3.0 ms (10%) shorter |
 | `EXL3_PRELAUNCH` | 1 | pipelined decode step for a single conversation: the next MTP drafts + verify are launched as soon as a step's accepted tokens are known, before its bookkeeping (needs the two graphs above) |
 | `EXL3_ROUTER_FUSED` | 1 | router GEMV + sigmoid/bias top-8 as one kernel (each top-k round is two warp reductions over order-preserving keys; the same selections as a sequential scan) |
 | `EXL3_NORM_ROUTE` | 1 | decode MoE layers (2..8 rows): the post-attention RMSNorm and the router as one kernel of 4 thread-block clusters x 16 CTAs (`runtime/core/nr4_kernel.cuh`). Each CTA owns the column sets of two of the norm kernel's warps and repeats their partial sums, so the residual and the MoE input are bit-identical to the separate norm; it stages its cluster's 64-expert slice of the gate while the norm runs, the partial logits run on tensor cores and are summed through distributed shared memory, and the clusters' top-8 candidates are merged by the last cluster leader in the fused router's key order (the same selections up to exact near-ties). 0 = the norm kernel + `EXL3_ROUTER_FUSED` |

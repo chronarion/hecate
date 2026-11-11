@@ -27,17 +27,17 @@ OpenAI-stream-only measurement.
 Model context length: 262,144 tokens
 Prefill tests: standalone cold profile ['1k', '4k', '8k', '16k', '32k', '64k', 
 '128k']
-Calibrating padding text (run=psdinmwusxni, up to 128k)...
+Calibrating padding text (run=opiqiyynkfny, up to 128k)...
   Token targeting: single-point estimate from 8k (use --token-targeting exact 
 for /tokenize binary search)
   Calibrated: 6.18 chars/token (from 8k probe)
-  1k: 6,324 chars (~1,023 tokens)
-  4k: 25,299 chars (~4,095 tokens)
-  8k: 50,598 chars (~8,191 tokens)
-  16k: 101,196 chars (~16,383 tokens)
-  32k: 202,393 chars (~32,767 tokens)
-  64k: 404,786 chars (~65,535 tokens)
-  128k: 809,572 chars (~131,071 tokens)
+  1k: 6,325 chars (~1,023 tokens)
+  4k: 25,300 chars (~4,095 tokens)
+  8k: 50,601 chars (~8,191 tokens)
+  16k: 101,202 chars (~16,383 tokens)
+  32k: 202,404 chars (~32,767 tokens)
+  64k: 404,809 chars (~65,535 tokens)
+  128k: 809,618 chars (~131,071 tokens)
 Done.
 
 
@@ -48,13 +48,13 @@ Prefill Speed (C=1, client ISL / TTFT)
                                       Client                   PCIe rx/tx       
   Context    Tokens   TTFT (s)         tok/s   Server tok/s           avg    N  
  ────────────────────────────────────────────────────────────────────────────── 
-  1k          1,154       0.37         3,158              —             —   20  
-  4k          4,170       1.13         3,692              —             —    7  
-  8k          8,200       1.83         4,489              —             —    5  
-  16k        16,230       3.53         4,595              —             —    3  
-  32k        32,321       7.11         4,546              —             —    2  
-  64k        64,511      14.33         4,501              —             —    1  
-  128k      128,880      29.77         4,329              —             —    1  
+  1k          1,154       0.36         3,170              —             —   20  
+  4k          4,169       1.15         3,634              —             —    7  
+  8k          8,200       1.84         4,445              —             —    5  
+  16k        16,229       3.55         4,573              —             —    3  
+  32k        32,322       7.11         4,545              —             —    2  
+  64k        64,514      14.40         4,479              —             —    1  
+  128k      128,888      30.01         4,294              —             —    1  
                                                                                 
 Client tok/s = prompt_tokens / TTFT. Integrated scout rows come from the 
 prefix-cache scout request that decode needs anyway. Server tok/s is optional 

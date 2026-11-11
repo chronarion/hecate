@@ -27,7 +27,7 @@ OpenAI-stream-only measurement.
 Model context length: 262,144 tokens
 Prefill tests: standalone cold profile ['1k', '4k', '8k', '16k', '32k', '64k', 
 '128k']
-Calibrating padding text (run=gsxmguibeqhs, up to 128k)...
+Calibrating padding text (run=ksormkrqgbei, up to 128k)...
   Token targeting: single-point estimate from 8k (use --token-targeting exact 
 for /tokenize binary search)
   Calibrated: 6.18 chars/token (from 8k probe)
@@ -48,13 +48,13 @@ Prefill Speed (C=1, client ISL / TTFT)
                                       Client                   PCIe rx/tx       
   Context    Tokens   TTFT (s)         tok/s   Server tok/s           avg    N  
  ────────────────────────────────────────────────────────────────────────────── 
-  1k          1,154       0.37         3,160              —             —   20  
-  4k          4,170       1.13         3,687              —             —    7  
-  8k          8,200       1.85         4,421              —             —    5  
-  16k        16,230       3.58         4,536              —             —    3  
-  32k        32,321       7.09         4,556              —             —    2  
-  64k        64,511      14.64         4,406              —             —    1  
-  128k      128,880      29.13         4,424              —             —    1  
+  1k          1,154       0.34         3,379              —             —   20  
+  4k          4,170       1.08         3,872              —             —    7  
+  8k          8,200       1.73         4,751              —             —    5  
+  16k        16,230       3.37         4,821              —             —    3  
+  32k        32,321       6.73         4,803              —             —    2  
+  64k        64,511      13.57         4,755              —             —    1  
+  128k      128,880      27.96         4,610              —             —    1  
                                                                                 
 Client tok/s = prompt_tokens / TTFT. Integrated scout rows come from the 
 prefix-cache scout request that decode needs anyway. Server tok/s is optional 

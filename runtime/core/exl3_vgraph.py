@@ -41,8 +41,18 @@ CHECK = int(os.environ.get("EXL3_VERIFY_GRAPH_CHECK", "0") or 0)
 # loop's in-place `cache_seqlens += 1` on a pinned buffer would race its async uploads once the host runs ahead). Hooked
 # from the patched generator's iterate_draftmodel_mtp_gen; returns None to fall back to the eager loop
 DRAFT = os.environ.get("EXL3_DRAFT_GRAPH", "0") == "1"
-_D = {"graphs": {}, "warm": set(), "buf": {}, "pool": None, "cs": None, "dead": False,
+# EXL3_VERIFY_GRAPH_BATCH=1: decode steps of 2..8 sequences (B sequences x R rows, B * R <= 8; drafted or not) replay from
+# one graph per (B, R, block-table width, regime), in their own tables (a failure there leaves the single-sequence graphs
+# on). The regime is the batch's (max over the rows, as BCMLA.step decides it); the RTX graph is launched for B * R rows
+BATCH = os.environ.get("EXL3_VERIFY_GRAPH_BATCH", "0") == "1"
+BMAX = int(os.environ.get("EXL3_VERIFY_GRAPH_BMAX", "96") or 0)      # LRU cap on batch graphs (0 = unbounded)
+_SB = {"graphs": collections.OrderedDict(), "warm": set(), "ids": {}, "pool": None, "dead": False, "chk": {},
+       "n": {"replay": 0, "capture": 0, "evict": 0}}
+_D = {"graphs": {}, "warm": set(), "buf": {}, "pool": None, "cs": None, "dead": False, "dead_b": False,
       "n": {"draft_replay": 0, "draft_capture": 0, "draft_eager": 0}}
+# EXL3_DRAFT_GRAPH_BATCH=1: the MTP draft passes of 2..4 sequences (no gap rows) replay as one graph per
+# ("b", bsz, window, width, regime); a failed capture turns only these off
+DRAFT_BATCH = os.environ.get("EXL3_DRAFT_GRAPH_BATCH", "0") == "1"
 
 
 def _draft_body(gen, B, n_gap, window, sl_host):
@@ -57,7 +67,7 @@ def _draft_body(gen, B, n_gap, window, sl_host):
             torch.add(B["slb"], idx, out=B["sl"][idx])
         params = {"target_hidden": hid, "attn_mode": "flash_attn", "block_table": B["bt"], "cache": gen.draft_cache,
                   "cache_seqlens": B["sl"][idx], "draft_step": idx, "sparse_head": gen._sparse_flag,
-                  "_mla_host_seqlens": [sl_host - n_gap if idx == 0 else sl_host + idx]}
+                  "_mla_host_seqlens": [s - n_gap if idx == 0 else s + idx for s in sl_host]}
         state = dm.forward(ids, params)
         if idx == 0 and n_gap:
             state = state[:, -1:, :]
@@ -70,12 +80,15 @@ def _draft_body(gen, B, n_gap, window, sl_host):
 
 
 def draft_graph(gen, bsz, block_index, cache_seqlens, batch_ids, temp_hidden, gap, window, defer=False):
-    if _D["dead"] or _S["dead"] or _S["fe"] is None or bsz != 1:
+    if _D["dead"] or _S["dead"] or _S["fe"] is None:
+        return None
+    if bsz != 1 and not (DRAFT_BATCH and not _D["dead_b"] and 2 <= bsz <= 4 and gap is None and not defer):
         return None
     ts = sys.modules.get("tier_split")
     if ts is None:
         return None
-    sl = int(cache_seqlens[0])
+    sls = [int(x) for x in cache_seqlens.view(-1)[:bsz].tolist()]
+    sl = max(sls)
     n_gap = int(gap["ids"].shape[-1]) if gap is not None else 0
     lim = _S.get("maxctx") or MAXCTX or int(getattr(gen.model.config, "index_topk", 0) or 0) or (1 << 30)
     regime = int(sl + window + 1 > lim)
@@ -83,7 +96,10 @@ def draft_graph(gen, bsz, block_index, cache_seqlens, batch_ids, temp_hidden, ga
         _D["n"]["draft_eager"] += 1
         return None
     W = int(block_index.shape[1])
-    key = (window, n_gap, W, regime) if SPARSE else (window, n_gap, W)
+    if bsz > 1:
+        key = ("b", bsz, window, W, regime)
+    else:
+        key = (window, n_gap, W, regime) if SPARSE else (window, n_gap, W)
     if defer and key not in _D["graphs"]:
         return None
     if key not in _D["warm"]:
@@ -94,21 +110,21 @@ def draft_graph(gen, bsz, block_index, cache_seqlens, batch_ids, temp_hidden, ga
     B = _D["buf"].get(key)
     if B is None:
         B = _D["buf"][key] = dict(
-            ids0=torch.zeros((1, 1 + n_gap), dtype=torch.long, device=dev),
-            hid0=torch.zeros((1, 1 + n_gap, temp_hidden.shape[-1]), dtype=temp_hidden.dtype, device=dev),
-            bt=torch.zeros((1, W), dtype=block_index.dtype, device=dev),
-            slb=torch.zeros((1,), dtype=cache_seqlens.dtype, device=dev),
-            sl=[torch.zeros((1,), dtype=cache_seqlens.dtype, device=dev) for _ in range(window)])
+            ids0=torch.zeros((bsz, 1 + n_gap), dtype=torch.long, device=dev),
+            hid0=torch.zeros((bsz, 1 + n_gap, temp_hidden.shape[-1]), dtype=temp_hidden.dtype, device=dev),
+            bt=torch.zeros((bsz, W), dtype=block_index.dtype, device=dev),
+            slb=torch.zeros((bsz,), dtype=cache_seqlens.dtype, device=dev),
+            sl=[torch.zeros((bsz,), dtype=cache_seqlens.dtype, device=dev) for _ in range(window)])
     if n_gap:
         B["ids0"][:, :n_gap].copy_(gap["ids"].view(1, -1), non_blocking=True)
         B["ids0"][:, n_gap:].copy_(batch_ids.view(1, -1), non_blocking=True)
         B["hid0"][:, :n_gap].copy_(gap["target_hidden"].view(1, n_gap, -1), non_blocking=True)
         B["hid0"][:, n_gap:].copy_(temp_hidden.view(1, 1, -1))
     else:
-        B["ids0"].copy_(batch_ids.view(1, -1), non_blocking=True)
-        B["hid0"].copy_(temp_hidden.view(1, 1, -1))
-    B["bt"].copy_(block_index.view(1, -1), non_blocking=True)
-    B["slb"].copy_(cache_seqlens.view(-1)[:1], non_blocking=True)
+        B["ids0"].copy_(batch_ids[:bsz].view(bsz, -1), non_blocking=True)
+        B["hid0"].copy_(temp_hidden.view(bsz, 1, -1))
+    B["bt"].copy_(block_index[:bsz].view(bsz, -1), non_blocking=True)
+    B["slb"].copy_(cache_seqlens.view(-1)[:bsz], non_blocking=True)
     ent = _D["graphs"].get(key)
     if ent is None:
         if _D["pool"] is None:
@@ -124,14 +140,15 @@ def draft_graph(gen, bsz, block_index, cache_seqlens, batch_ids, temp_hidden, ga
             with torch.cuda.stream(cs):
                 g.capture_begin(pool=_D["pool"], capture_error_mode="thread_local")
                 try:
-                    out = _draft_body(gen, B, n_gap, window, sl)
+                    out = _draft_body(gen, B, n_gap, window, sls)
                 finally:
                     g.capture_end()
         except Exception as e:
             import traceback
             traceback.print_exc()
-            print(f" -- vgraph: draft capture of {key} failed ({type(e).__name__}: {e}); draft graphs off", flush=True)
-            _D["dead"] = True
+            print(f" -- vgraph: draft capture of {key} failed ({type(e).__name__}: {e}); "
+                  f"{'batch ' if bsz > 1 else ''}draft graphs off", flush=True)
+            _D["dead_b" if bsz > 1 else "dead"] = True
             torch.cuda.synchronize()
             return None
         finally:
@@ -234,7 +251,14 @@ def _report():
         why = ", ".join(f"{k} {v}" for k, v in sorted(_S["why"].items(), key=lambda kv: -kv[1]))
         print(f" -- vgraph: {n['replay']} replays, {n['capture']} captures ({_S['cap_s']:.1f} s), {n['eager']} eager"
               + (f" ({why})" if why else "") + f", {len(_S['graphs'])} graphs"
-              + (f"; drafts {_D['n']}" if DRAFT else ""), flush=True)
+              + (f"; drafts {_D['n']}" if DRAFT else "")
+              + (f"; batch {_SB['n']}, {len(_SB['graphs'])} graphs" if BATCH else ""), flush=True)
+        for k, c in sorted(_SB["chk"].items()):
+            mn = lambda i: sum(x[i] for x in c) / len(c)
+            print(f" -- vgraph check batch {k}: {len(c)} steps, KL(eager || graph) mean {mn(0):.2e} max "
+                  f"{max(x[0] for x in c):.2e}, top-1 agree {mn(1):.4f} | noise floor KL mean {mn(2):.2e} max "
+                  f"{max(x[2] for x in c):.2e}, top-1 agree {mn(3):.4f}", flush=True)
+        _SB["chk"] = {}
         if _S["chk"]:
             c = _S["chk"]; _S["chk"] = []
             mn = lambda i: sum(x[i] for x in c) / len(c)
@@ -263,6 +287,8 @@ def _verify(model, fw0, input_ids, params):
     ts = sys.modules.get("tier_split")
     if _S["dead"] or ts is None:
         _eager("off"); return fw0(model, input_ids, params)
+    if BATCH and input_ids.dim() == 2 and input_ids.shape[0] > 1:
+        return _verify_b(model, fw0, input_ids, params, ts)
     if input_ids.dim() != 2 or input_ids.shape[0] != 1 or not (2 <= input_ids.shape[1] <= 8) or input_ids.is_cuda:
         _eager("shape"); return fw0(model, input_ids, params)
     extra = set(params) - _PARAM_KEYS
@@ -351,6 +377,112 @@ def _verify(model, fw0, input_ids, params):
     return ent["out"]
 
 
+def _check(fw0, model, input_ids, params, ent):
+    """EXL3_VERIFY_GRAPH_CHECK: KL(eager || graph) and the eager-vs-eager noise floor for this step (see _verify)"""
+    p2 = {k: v for k, v in params.items() if k not in ent["new"]}
+    a = ent["out"].float().clone()
+    b = fw0(model, input_ids, dict(p2)).float().clone()
+    c = fw0(model, input_ids, dict(p2)).float()
+    la, lb, lc = (torch.log_softmax(t.view(-1, t.shape[-1]), -1) for t in (a, b, c))
+    kl = lambda p_, q_: (p_.exp() * (p_ - q_)).sum(-1).max().item()
+    return (kl(lb, la), (la.argmax(-1) == lb.argmax(-1)).float().mean().item(), kl(lb, lc),
+            (lb.argmax(-1) == lc.argmax(-1)).float().mean().item())
+
+
+def _verify_b(model, fw0, input_ids, params, ts):
+    """EXL3_VERIFY_GRAPH_BATCH: a decode step of B > 1 sequences x R rows from one graph per (B, R, width, regime)"""
+    B, R = input_ids.shape
+    rows = B * R
+    if _SB["dead"] or rows > 8 or input_ids.is_cuda:
+        _eager("b-shape"); return fw0(model, input_ids, params)
+    extra = set(params) - _PARAM_KEYS
+    if extra or params.get("recurrent_states") or params.get("indexed_embeddings"):
+        _eager("b-params " + ",".join(sorted(extra))); return fw0(model, input_ids, params)
+    sl_h, bt_h = params.get("cache_seqlens"), params.get("block_table")
+    if sl_h is None or bt_h is None or sl_h.is_cuda or bt_h.is_cuda or sl_h.numel() != B or bt_h.shape[0] != B:
+        _eager("b-host"); return fw0(model, input_ids, params)
+    sl = sl_h.tolist()
+    lim = _S.get("maxctx")
+    if lim is None:
+        lim = _S["maxctx"] = MAXCTX or int(getattr(model.config, "index_topk", 0) or 0) or (1 << 30)
+        print(f" -- vgraph: dense-regime bound {lim} tokens", flush=True)
+    regime = int(max(sl) + R > lim)                     # the batch's regime, as BCMLA.step decides it
+    if regime and not SPARSE:
+        _eager("b-sparse"); return fw0(model, input_ids, params)
+    dev = torch.device("cuda", torch.cuda.current_device())
+    ptrs = _dev_ptrs(params, dev)
+    if ptrs is None:
+        _eager("b-arena"); return fw0(model, input_ids, params)
+    key = (B, R, bt_h.shape[1], regime)
+    G = _SB["graphs"]
+    ent = G.get(key)
+    if ent is not None and ent["ptrs"] != ptrs:         # the arena for (B, W) was reallocated
+        del G[key]; ent = None
+        _S["why"]["b-recapture"] = _S["why"].get("b-recapture", 0) + 1
+    ids = _SB["ids"].get((B, R))
+    if ids is None:
+        ids = _SB["ids"][(B, R)] = torch.zeros((B, R), dtype=torch.long, device=dev)
+    if ent is None:
+        if key not in _SB["warm"]:                      # first step of a key: eager (configures the slot, RTX graph, scratch)
+            _SB["warm"].add(key)
+            _eager("b-warm"); return fw0(model, input_ids, params)
+        if BMAX and len(G) >= BMAX:
+            torch.cuda.synchronize()                    # nothing of the evicted graph in flight
+            G.popitem(last=False); _SB["n"]["evict"] += 1
+        t0 = time.perf_counter()
+        ids.copy_(input_ids, non_blocking=True)
+        p = dict(params); p["_mla_host_seqlens"] = sl
+        if _SB["pool"] is None:
+            _SB["pool"] = torch.cuda.graph_pool_handle()
+        m0 = torch.cuda.memory_allocated()
+        g = torch.cuda.CUDAGraph()
+        ts._VG["cap"] = True
+        if _S["fe"] is not None:
+            _S["fe"](True)
+        try:
+            with torch.cuda.graph(g, pool=_SB["pool"], capture_error_mode="thread_local"):
+                out = fw0(model, ids, p)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f" -- vgraph: batch capture of {key} failed ({type(e).__name__}: {e}); batch graphs off", flush=True)
+            _SB["dead"] = True
+            torch.cuda.synchronize()
+            todo = list(getattr(model, "modules", []))      # tier modules' per-step state left by the aborted forward
+            while todo:
+                m = todo.pop()
+                todo += list(getattr(m, "modules", []) or [])
+                for a in ("_nr_handed", "_cpu_gen", "_h_join"):
+                    if hasattr(m, a):
+                        setattr(m, a, 0 if a == "_nr_handed" else None)
+            _eager("b-failed"); return fw0(model, input_ids, params)
+        finally:
+            ts._VG["cap"] = False
+            if _S["fe"] is not None:
+                _S["fe"](False)
+        new = {k: v for k, v in p.items() if k not in params and k not in ("_mla_host_seqlens", "input_ids",
+                                                                           "layer_instance", "resid_defer")}
+        ent = G[key] = {"g": g, "out": out, "new": new, "ptrs": ptrs}
+        _SB["n"]["capture"] += 1; _S["cap_s"] += time.perf_counter() - t0
+        print(f" -- vgraph: captured batch {key} in {time.perf_counter() - t0:.2f} s "
+              f"(+{(torch.cuda.memory_allocated() - m0) / 2**20:.1f} MiB), outputs {sorted(new)}", flush=True)
+    else:
+        G.move_to_end(key)
+        ids.copy_(input_ids, non_blocking=True)
+    if ts.rg.MODS:
+        ts.rg.launch(rows)                              # the step's RTX band for all B * R rows
+    ent["g"].replay()
+    ev = torch.cuda.Event(); ev.record(); _S["last_ev"] = (ev, time.time())
+    _S["ring"].append(f"replay b{B}x{R}x{key[2]} {regime} sl {max(sl)}")
+    for k, v in ent["new"].items():
+        params[k] = [t.clone() for t in v] if k == "export_states" else v
+    _SB["n"]["replay"] += 1
+    if CHECK and _SB["n"]["replay"] % CHECK == 0:
+        _SB["chk"].setdefault((B, R, regime), []).append(_check(fw0, model, input_ids, params, ent))
+    _report()
+    return ent["out"]
+
+
 def install():
     if not ON:
         return
@@ -366,7 +498,13 @@ def install():
 
     def iterate_gen(self, results, draft_tokens=None, pre=None):
         if draft_tokens is None:
-            return ig(self, results, draft_tokens, pre=pre)
+            n = 0
+            if BATCH:
+                for j in self.active_jobs:
+                    if j.is_prefill_done():
+                        n += len(j.sequences)
+            if n < 2:                                   # one request without drafts: untouched
+                return ig(self, results, draft_tokens, pre=pre)
         m = self.model
         prev = m.__dict__.get("forward")
         fw = m.forward                      # bound (class or an inner wrapper's) forward

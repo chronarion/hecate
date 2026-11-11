@@ -31,6 +31,7 @@ GGUF or safetensors checkpoint.
 |---|---|
 | Decode, concurrency 1, realistic workloads (temperature 1) | 144-212 tok/s by workload |
 | Decode, concurrency 1 (10 prompts, greedy, MTP 3 drafts) | ~176 tok/s |
+| Decode, several conversations (llm-inference-bench, total) | 2: 179 · 4: 244 · 8: 292 tok/s at short context |
 | KL divergence vs BF16 (rtx6kpro protocol, 36,848 positions) | 0.0734 (see the benchmarks below) |
 | Context | 2 × 256K (Q6 KV) by default; one 1M-token conversation with the long-context profile |
 
@@ -68,26 +69,42 @@ driver 615.71, CUDA 13.0.
 
 Raw JSON and logs: [`benchmarks/`](https://github.com/chronarion/hecate/tree/main/benchmarks).
 
-#### Decode, aggregate tok/s by context and concurrency (llm-inference-bench: 30 s windows, ignore_eos, 2048 max tokens, the server's default temperature 1.0; mean of the runs that measured the cell)
+#### Decode, total tok/s by context and concurrency (llm-inference-bench: 30 s windows, ignore_eos, 2048 max tokens, the server's default temperature 1.0; release 1.10)
 
 | Context | C=1 | C=2 | C=4 | C=8 | C=16 | C=32 |
 |---|---:|---:|---:|---:|---:|---:|
-| 0 | 168 | 209 | 117 | 247 | 8 run + 8 queue | 8 run + 24 queue |
-| 4K | 148 | 185 | 117 | 251 | - | - |
-| 16K | 152 | 182 | 113 | 246 | - | - |
-| 32K | 156 | 172 | 115 | 247 | - | - |
-| 64K | 150 | 181 | 114 | - | - | - |
-| 128K | 146 | 172 | - | - | - | - |
+| 0 | 140 | 179 | 244 | 292 | 293 (8 running, 8 queued) | 297 (8 running, 24 queued) |
+| 4K | 132 | 187 | 249 | 293 | - | - |
+| 16K | 136 | 188 | 243 | 283 | - | - |
+| 32K | 131 | 187 | 245 | 284 | - | - |
+| 64K | 131 | 186 | 237 | - | - | - |
+| 128K | 127 | 178 | - | - | - | - |
 
-Each request gets the aggregate divided by C. Hecate is tuned for a few conversations: at most 8 requests decode at
-once (`HECATE_MAX_BATCH`) and later ones wait in the queue, then run at full speed: at C=16 each request decoded at ~31
-tok/s once it started, ~250 tok/s in aggregate, after waiting ~37 s on average for a slot (the benchmark's own aggregate
-for queued cells is not meaningful). MTP drafts take rows too: 4 concurrent requests get one draft each, 8 none.
+Each request gets the total divided by C. At most 8 requests decode at once (`HECATE_MAX_BATCH`); later ones wait in
+the queue and then run at full speed. MTP drafts take rows too: 4 concurrent requests get one draft each, 8 none.
 Streamed requests start ahead of non-streamed ones (see the GitHub docs, configuration, "Concurrency"). Single C=1 cells vary by up
-to ±10% between runs, because MTP acceptance depends on the generated text; on this benchmark 1.9 and 1.8 measured the
-same at C=1 in one session (the 1.9 gains show on the workloads below).
+to ±10% between runs, because MTP acceptance depends on the generated text.
 
-On our short greedy test 1.9 is ~3% slower than 1.8 (~176 vs ~181 tok/s, means over 6 and 3 server restarts; a single
+The benchmark counts tokens from the usage numbers a server attaches to every streamed chunk (vLLM's
+`stream_options.continuous_usage_stats`). TabbyAPI sent usage only at the end of a request, so until 1.9 the benchmark
+credited a finished request's whole output when it ended (C=1 and C=2 read ~15-20% high) and fell back to counting
+chunks when no request finished inside its 30 s window (C=4 read half its real value: one chunk holds a whole MTP step).
+Hecate sends per-chunk usage since 1.10, so these numbers are comparable with other servers' but not with the tables of
+earlier releases. Compare releases with the same-session numbers below.
+
+#### Several conversations, 1.9 vs 1.10 in one session (each request's own decode speed, tok/s, streamed requests)
+
+| Conversations | short prompt, 1.9 | 1.10 | ~16K-token context, 1.9 | 1.10 |
+|---|---:|---:|---:|---:|
+| 2 | 90 | 97 | 81 | 98 |
+| 4 | 57 | 65 | 54 | 64 |
+| 8 | 30 | 36 | 32 | 37 |
+
+Under overload (`tools/bench/overload_check.py` in the GitHub repo: 48 batch requests and a streamed request every 45 s) the running batch
+requests decode at 43 tok/s (1.9: 35) and streamed requests get their first token within 0.3 s; with 24 batch requests
+carrying unique 30K-token prompts, streamed requests get their first token within 2.3 s (1.9: up to 38 s).
+
+On our short greedy test 1.9 was ~3% slower than 1.8 (~176 vs ~181 tok/s, means over 6 and 3 server restarts; a single
 restart moves it by ±3%). Switching the new drafts or the request scheduling off does not change it. About 1% comes from
 the new expert placement, which is ranked for real traffic rather than for this test (1.9 with the old placement: ~178);
 the rest is likely the Grace band fix, which now computes experts that were skipped before.

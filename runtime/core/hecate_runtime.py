@@ -220,9 +220,62 @@ import contextvars
 REQUEST = contextvars.ContextVar("hecate_request", default=None)
 
 
+class _UsageQueue:
+    """a stream collector's output queue that marks each generation for per-chunk usage"""
+    def __init__(self, q):
+        self._q = q
+
+    async def put(self, item):
+        if isinstance(item, dict):
+            item["_hecate_usage"] = True
+        await self._q.put(item)
+
+    def __getattr__(self, name):
+        return getattr(self._q, name)
+
+
+def _patch_stream_usage():
+    """stream_options.continuous_usage_stats (vLLM's extension, which TabbyAPI drops): every streamed chat chunk then
+    carries the request's cumulative usage. Without it a client that counts tokens from usage (llm-inference-bench) sees
+    nothing until a request finishes and counts SSE chunks instead, and with MTP one chunk holds a whole step's tokens"""
+    try:
+        import json
+        from endpoints.OAI.types import common as T
+        from endpoints.OAI.types import chat_completion as _cct  # noqa: F401  (define the request models to rebuild)
+        from endpoints.OAI.utils import chat_completion as CC
+    except Exception as e:
+        print(f" -- hecate: no per-chunk usage ({type(e).__name__}: {e})", flush=True)
+        return
+    T.ChatCompletionStreamOptions.model_config["extra"] = "allow"
+    T.ChatCompletionStreamOptions.model_rebuild(force=True)
+    todo = [T.CommonCompletionRequest]
+    while todo:
+        c = todo.pop()
+        c.model_rebuild(force=True)
+        todo += c.__subclasses__()
+    collector, compose = CC._chat_stream_collector, CC._compose_serialize_stream_chunk
+
+    async def _chat_stream_collector(task_idx, gen_queue, request_id, prompt, params, *a, **k):
+        so = getattr(params, "stream_options", None)
+        if gen_queue is not None and so is not None and (so.model_extra or {}).get("continuous_usage_stats"):
+            gen_queue = _UsageQueue(gen_queue)
+        return await collector(task_idx, gen_queue, request_id, prompt, params, *a, **k)
+
+    def _compose_serialize_stream_chunk(request_id, generation=None, *a, **k):
+        s, d, finish_reason, is_empty = compose(request_id, generation, *a, **k)
+        if generation and generation.get("_hecate_usage") and "generated_tokens" in generation:
+            p, g = generation.get("prompt_tokens") or 0, generation["generated_tokens"]
+            d["usage"] = {"prompt_tokens": p, "completion_tokens": g, "total_tokens": p + g}
+            s = json.dumps(d, ensure_ascii=False)
+        return s, d, finish_reason, is_empty
+    CC._chat_stream_collector = _chat_stream_collector
+    CC._compose_serialize_stream_chunk = _compose_serialize_stream_chunk
+
+
 def patch_tabby():
     """wrap TabbyAPI's ExllamaV3Container.generate_gen so the job it creates is tagged with its request's class; called
     by the entrypoint once /opt/tabbyAPI is importable, before TabbyAPI's main runs"""
+    _patch_stream_usage()
     if os.environ.get("HECATE_PRIORITY", "stream") == "off":
         return
     try:

@@ -70,6 +70,9 @@ RUN python3 /tmp/p/cn/apply_cn.py ${SP} && python3 /tmp/p/cn/apply_cnfill.py ${S
 RUN python3 /tmp/p/topk/apply_topk_radix.py ${EXT} /tmp/p/topk
 # 12. tcgen05 prefill DSA indexer scoring (runtime/core/hidx.cu, JIT-built; EXL3_HIDX)
 RUN python3 /tmp/p/hidx/apply_hidx.py ${SP}/modules/mla_attn.py /opt/hecate/core/hidx.cu
+# 13. the tcgen05 sparse attention (6) for decode batches of several sequences (EXL3_HMLA_BATCH); after 7, which adds
+#     the second call site
+RUN python3 /tmp/p/hmla/apply_hmla_batch.py ${EXT}
 RUN cd /opt/exllamav3 && (MAX_JOBS=${MAX_JOBS} python setup.py build_ext > /tmp/build_ext.log 2>&1 \
       || (grep -B2 -A8 -E " error|Error" /tmp/build_ext.log | head -80; exit 1)) \
  && cp build/lib.linux-aarch64-cpython-312/exllamav3_ext.cpython-312-aarch64-linux-gnu.so /opt/venv/lib/python3.12/site-packages/ \
@@ -99,7 +102,7 @@ ENV EXL3_MOE4_SRC=/opt/hecate/tier/moe4 EXL3_TIER_BUILD=/root/.cache/hecate-tier
     EXL3_SKIP_TRELLIS=1 \
     EXL3_RTX_CAP_ROWS=8192 EXL3_PREFILL_GROUP=24 EXL3_RTX_PREFILL_ROWS=64 EXL3_PREFILL_DECODE_SHARE=0.3 \
     EXL3_RTX_PREFILL_MOE3P=1 EXL3_TIER_PREFILL_MOE4P=1 EXL3_PREFILL_GB300_ROWS=2048 \
-    EXL3_GRAPHS=1 EXL3_VERIFY_GRAPH=1 EXL3_VERIFY_GRAPH_EVERY=2000 EXL3_DRAFT_GRAPH=1 EXL3_ROUTER_FUSED=1 \
+    EXL3_GRAPHS=1 EXL3_VERIFY_GRAPH=1 EXL3_VERIFY_GRAPH_EVERY=2000 EXL3_DRAFT_GRAPH=1 EXL3_VERIFY_GRAPH_BATCH=1 EXL3_DRAFT_GRAPH_BATCH=1 EXL3_BATCH_ONESYNC=1 EXL3_HMLA_BATCH=1 EXL3_ROUTER_FUSED=1 \
     EXL3_DSA_MULTIROW=1 EXL3_VERIFY_GRAPH_SPARSE=1 EXL3_MLA_KVQ=3 EXL3_TIER_HSIDE=1 EXL3_NORM2=1 EXL3_TIER_COMBINE_NORM=1 \
     EXL3_DSA_TOPK_SPLIT=0 EXL3_MLA_SPLIT_TPS=2 EXL3_MLA_SPLIT_TILES=1 EXL3_MLA_COMBINE_DSPLIT=16 EXL3_COMBINE_CFG=8,1 \
     EXL3_MLA_BLOCK_H_Q=4 EXL3_DSA_SCORE_TILE=262144 EXL3_HIDX=1 EXL3_DSA_TOPK_RADIX=16384 \

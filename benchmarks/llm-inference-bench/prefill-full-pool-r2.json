@@ -4,7 +4,7 @@
     "engine": "openai_proxy",
     "model": "base",
     "server": "127.0.0.1:8103",
-    "timestamp": "2026-11-10T09:30:24.472792",
+    "timestamp": "2026-11-11T00:00:38.996484",
     "decode_mode": "duration",
     "primary_decode_layer": "sustained_decode",
     "duration_per_test": 30.0,
@@ -185,11 +185,11 @@
   "event_log": [],
   "prefill": {
     "1024": {
-      "ttft_seconds": 0.365,
-      "prefill_seconds": 0.365,
-      "tok_per_sec": 3158.0,
-      "client_ttft_seconds": 0.365,
-      "client_tok_per_sec": 3158.0,
+      "ttft_seconds": 0.364,
+      "prefill_seconds": 0.364,
+      "tok_per_sec": 3170.0,
+      "client_ttft_seconds": 0.364,
+      "client_tok_per_sec": 3170.0,
       "prompt_tokens": 1154,
       "samples": 20,
       "method": "client",
@@ -207,12 +207,12 @@
       "hardware_summary": {}
     },
     "4096": {
-      "ttft_seconds": 1.13,
-      "prefill_seconds": 1.13,
-      "tok_per_sec": 3692.0,
-      "client_ttft_seconds": 1.13,
-      "client_tok_per_sec": 3692.0,
-      "prompt_tokens": 4170,
+      "ttft_seconds": 1.147,
+      "prefill_seconds": 1.147,
+      "tok_per_sec": 3634.0,
+      "client_ttft_seconds": 1.147,
+      "client_tok_per_sec": 3634.0,
+      "prompt_tokens": 4169,
       "samples": 7,
       "method": "client",
       "server_validation": {
@@ -229,11 +229,11 @@
       "hardware_summary": {}
     },
     "8192": {
-      "ttft_seconds": 1.826,
-      "prefill_seconds": 1.826,
-      "tok_per_sec": 4489.0,
-      "client_ttft_seconds": 1.826,
-      "client_tok_per_sec": 4489.0,
+      "ttft_seconds": 1.845,
+      "prefill_seconds": 1.845,
+      "tok_per_sec": 4445.0,
+      "client_ttft_seconds": 1.845,
+      "client_tok_per_sec": 4445.0,
       "prompt_tokens": 8200,
       "samples": 5,
       "method": "client",
@@ -251,12 +251,12 @@
       "hardware_summary": {}
     },
     "16384": {
-      "ttft_seconds": 3.532,
-      "prefill_seconds": 3.532,
-      "tok_per_sec": 4595.0,
-      "client_ttft_seconds": 3.532,
-      "client_tok_per_sec": 4595.0,
-      "prompt_tokens": 16230,
+      "ttft_seconds": 3.549,
+      "prefill_seconds": 3.549,
+      "tok_per_sec": 4573.0,
+      "client_ttft_seconds": 3.549,
+      "client_tok_per_sec": 4573.0,
+      "prompt_tokens": 16229,
       "samples": 3,
       "method": "client",
       "server_validation": {
@@ -273,12 +273,12 @@
       "hardware_summary": {}
     },
     "32768": {
-      "ttft_seconds": 7.109,
-      "prefill_seconds": 7.109,
-      "tok_per_sec": 4546.0,
-      "client_ttft_seconds": 7.109,
-      "client_tok_per_sec": 4546.0,
-      "prompt_tokens": 32321,
+      "ttft_seconds": 7.111,
+      "prefill_seconds": 7.111,
+      "tok_per_sec": 4545.0,
+      "client_ttft_seconds": 7.111,
+      "client_tok_per_sec": 4545.0,
+      "prompt_tokens": 32322,
       "samples": 2,
       "method": "client",
       "server_validation": {
@@ -295,12 +295,12 @@
       "hardware_summary": {}
     },
     "65536": {
-      "ttft_seconds": 14.333,
-      "prefill_seconds": 14.333,
-      "tok_per_sec": 4501.0,
-      "client_ttft_seconds": 14.333,
-      "client_tok_per_sec": 4501.0,
-      "prompt_tokens": 64511,
+      "ttft_seconds": 14.404,
+      "prefill_seconds": 14.404,
+      "tok_per_sec": 4479.0,
+      "client_ttft_seconds": 14.404,
+      "client_tok_per_sec": 4479.0,
+      "prompt_tokens": 64514,
       "samples": 1,
       "method": "client",
       "server_validation": {
@@ -317,12 +317,12 @@
       "hardware_summary": {}
     },
     "131072": {
-      "ttft_seconds": 29.774,
-      "prefill_seconds": 29.774,
-      "tok_per_sec": 4329.0,
-      "client_ttft_seconds": 29.774,
-      "client_tok_per_sec": 4329.0,
-      "prompt_tokens": 128880,
+      "ttft_seconds": 30.014,
+      "prefill_seconds": 30.014,
+      "tok_per_sec": 4294.0,
+      "client_ttft_seconds": 30.014,
+      "client_tok_per_sec": 4294.0,
+      "prompt_tokens": 128888,
       "samples": 1,
       "method": "client",
       "server_validation": {

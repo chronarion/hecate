@@ -316,6 +316,14 @@ class BCMLA:
         # hecate: EXL3_MLA_BLOCK_H[_Q] widens the head block (fewer programs re-dequantizing the same quantized
         # KV tile; the split count grows to keep the SMs busy); _Q applies to quantized caches only
         block_h = int(_os.environ.get("EXL3_MLA_BLOCK_H_Q" if self.quant else "EXL3_MLA_BLOCK_H", 0)) or block_h
+        # hecate (concurrency): batch slots of the quantized cache get as many (row, head) pairs per program as the
+        # single-request verify slot (1 sequence x 4 rows x 4 heads = 16); with 4 heads per program a (B, 1) slot ran 4x
+        # the programs per sequence, each dequantizing the same KV tiles, and the split cap fell to 2-3, so every
+        # program walked 11-16 KV tiles at 2K context instead of 2-3. 0 = the head block above for batches too
+        if self.quant and bsz > 1:
+            rows_b = int(_os.environ.get("EXL3_MLA_BLOCK_ROWS_B", "16") or 0)
+            if rows_b:
+                block_h = max(block_h, rows_b // block_m)
         block_h = min(block_h, max(1, triton.next_power_of_2(H)))
         block_rows = block_m * block_h
         block_n = int(_os.environ.get("EXL3_MLA_BLOCK_N", 0)) or (64 if self.quant else (32 if D_c <= 512 else 16))

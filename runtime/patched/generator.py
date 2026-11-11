@@ -13,6 +13,12 @@ from ..constants import PAGE_SIZE
 _BT_FINE = os.environ.get("EXL3_BT_FINE", "0") == "1"
 _PF_SHARE = min(0.9, max(0.0, float(os.environ.get("EXL3_PREFILL_DECODE_SHARE", "0") or 0)))
 _MTP_MERGE = os.environ.get("EXL3_MTP_MERGE_GAP", "0") == "1"
+_SCHED_LOG = os.environ.get("HECATE_SCHED_LOG", "")       # diagnostic: one line per iteration (see iterate)
+# hecate (concurrency): EXL3_PREFILL_DECODE_SHARE is the share of time the generating jobs keep while prompts are ingested
+# (after a pass of p seconds the next waits p * share / (1 - share)). While an interactive job generates and the waiting
+# prompt is a batch job's, the generating jobs keep HECATE_DECODE_SHARE_INTERACTIVE instead (agents stay fast under a batch
+# flood); an interactive prompt while no other interactive job generates starts without waiting out the cooldown
+_DEC_INT = min(0.95, max(0.05, float(os.environ.get("HECATE_DECODE_SHARE_INTERACTIVE", "0.8") or 0.8)))
 
 
 def _sampler_itemp(sampler) -> float:
@@ -63,6 +69,9 @@ from ..util import profile_opt
 # Test hook: True forces the per-position serial speculative-window readback instead of the batched
 # (launch-all-samplers, one pinned stage, one synchronize) path
 _NO_BATCH_READBACK = False
+# hecate (EXL3_BATCH_ONESYNC=1): with several drafting jobs, every batchable job's W samplers launch first and read back
+# with one synchronize, before the per-job accept walks (was one launch + synchronize per job inside the walk)
+_ONESYNC = os.environ.get("EXL3_BATCH_ONESYNC", "0") == "1"
 
 _PRELAUNCH = os.environ.get("EXL3_PRELAUNCH", "1") == "1"   # hecate: pipelined MTP decode step
 # hecate (copy drafts): when the newest tokens repeat at least EXL3_COPY_MIN tokens of earlier context, verify the up to
@@ -801,6 +810,7 @@ class Generator:
             "Draft cache tensors were never allocated. Construct the draft Cache BEFORE calling draft_model.load()"
 
         results = []
+        _it0 = time.perf_counter() if _SCHED_LOG else 0.0
         self.iterate_start_jobs(results)
         pre = self._pre_take()   # hecate (prelaunch): drafts + verify of this step launched by the previous iteration
 
@@ -809,9 +819,18 @@ class Generator:
         # shared chunk size, and only once the cooldown since the previous pass has elapsed, so every call
         # still produces one generation step for the generating jobs. The other jobs' passes are deferred;
         # jobs with nothing left to ingest keep their call, which only does bookkeeping. With no job
-        # generating, or with a full shared chunk and no cooldown, every job runs a full chunk on every
-        # iteration
+        # generating, or with a full shared chunk and no cooldown, one job runs a full chunk on every
+        # iteration (hecate; stock: every job)
         prefilling = [job for job in self.active_jobs if not job.is_prefill_done()]
+        # hecate (concurrency): the one job that ingests next is the oldest interactive one; batch jobs take turns (round
+        # robin, as before), so their prompts finish together and they start generating as one wide batch (a step costs
+        # about the same for 1 row as for 6)
+        inter = sorted((j for j in prefilling if getattr(j, "hecate_cls", 0) == 0), key = lambda j: j.serial_number)
+        batch = [j for j in prefilling if getattr(j, "hecate_cls", 0) != 0]
+        if not inter and batch:
+            k = self.prefill_rotation % len(batch)
+            batch = batch[k:] + batch[:k]
+        prefilling = inter + batch
         chunk_size = None
         pf_timed = None
         deferred = []
@@ -820,23 +839,30 @@ class Generator:
             if self.shared_chunk_size < self.max_chunk_size:
                 chunk_size = self.shared_chunk_size
             if _PF_SHARE > 0:
-                if time.perf_counter() < getattr(self, "_pf_next", 0.0):
+                sel_int = getattr(prefilling[0], "hecate_cls", 0) == 0
+                dec_int = any(getattr(j, "hecate_cls", 0) == 0 for j in self.active_jobs if j.is_prefill_done())
+                pf_share = _DEC_INT if dec_int and not sel_int else _PF_SHARE
+                if time.perf_counter() < getattr(self, "_pf_next", 0.0) and not (sel_int and not dec_int):
                     deferred = prefilling
                 else:
-                    selected = prefilling[self.prefill_rotation % len(prefilling)]
-                    self.prefill_rotation += 1
-                    deferred = [job for job in prefilling if job is not selected]
+                    deferred = prefilling[1:]
                     pf_timed = time.perf_counter()
+                    self.prefill_rotation += 1
             elif self.prefill_cooldown_left > 0:
                 self.prefill_cooldown_left -= 1
                 deferred = prefilling
             else:
                 self.prefill_cooldown_left = self.prefill_cooldown
-                selected = prefilling[self.prefill_rotation % len(prefilling)]
+                deferred = prefilling[1:]
                 self.prefill_rotation += 1
-                deferred = [job for job in prefilling if job is not selected]
         else:
             self.prefill_cooldown_left = 0
+            # hecate (concurrency): with no job generating yet, one job's chunk per iteration (was every job's), so an
+            # iteration stays one chunk long: requests that arrive meanwhile are admitted (iterate_start_jobs) within a
+            # chunk, and the first job starts generating as soon as its own prompt is in
+            deferred = prefilling[1:]
+            if len(prefilling) > 1:
+                self.prefill_rotation += 1
         for job in list(self.active_jobs):
             if any(job is d for d in deferred):
                 continue
@@ -845,10 +871,11 @@ class Generator:
             except Exception as e:
                 self.reap_failed_job(job, e, results)
 
+        _it1 = time.perf_counter() if _SCHED_LOG else 0.0
         if pf_timed is not None:
             torch.cuda.synchronize()
             t_end = time.perf_counter()
-            self._pf_next = t_end + (t_end - pf_timed) * _PF_SHARE / (1.0 - _PF_SHARE)
+            self._pf_next = t_end + (t_end - pf_timed) * pf_share / (1.0 - pf_share)
 
         # Recurrent checkpoints
         if self.recurrent_cache is not None:
@@ -908,6 +935,17 @@ class Generator:
         if self.disk_page_cache is not None and self.active_jobs and self.disk_cache_write_interval > 0:
             self.write_behind()
 
+        if _SCHED_LOG:
+            # time, iteration s, prefill s (host until the prefill calls returned; synchronized when timed), active,
+            # decoding (interactive), prefilling, prefill job's class or -, draft window, max context of the decoding jobs
+            dec = [j for j in self.active_jobs if j.is_prefill_done()]
+            if not hasattr(self, "_sched_f"):
+                self._sched_f = open(_SCHED_LOG, "a", buffering=1 << 16)
+            pj = [j for j in prefilling if not any(j is d for d in deferred)]
+            self._sched_f.write(f"{time.time():.3f} {time.perf_counter() - _it0:.4f} {_it1 - _it0:.4f} {len(self.active_jobs)} "
+                                f"{len(dec)} {sum(getattr(j, 'hecate_cls', 0) == 0 for j in dec)} {len(prefilling)} "
+                                f"{getattr(pj[0], 'hecate_cls', '-') if pj else '-'} {draft_window} "
+                                f"{max((j.sequences[0].kv_position for j in dec), default=0)}\n")
         # Finished iteration
         return results
 
@@ -942,6 +980,7 @@ class Generator:
         self.sample_pinned = None
         self.staging_buffers = {}
         self.stage_arenas = {}
+        self.stage_arenas_b = {}
         self.draft_input_ids_pinned = None
         self.draft_ids_pinned = None
         self.filter_pool.shutdown(wait = False)
@@ -1653,14 +1692,17 @@ class Generator:
         copy per attention device. Keyed by shape, so the views keep their identity from step to step.
         """
         key = (rows, width, with_positions)
-        arena = self.stage_arenas.get(key)
+        # hecate: batch arenas (rows > 1) in their own table with a larger limit, so batch churn never clears the
+        # single-sequence arenas (each clear forces every graph baked on them to recapture)
+        tab = self.stage_arenas if rows <= 1 else self.__dict__.setdefault("stage_arenas_b", {})
+        arena = tab.get(key)
         if arena is None:
-            if len(self.stage_arenas) >= 32:
-                self.stage_arenas.clear()
+            if len(tab) >= (32 if rows <= 1 else 256):
+                tab.clear()
             n = rows * width + rows * (2 if with_positions else 1)
             host = torch.zeros((n,), dtype = torch.int32, pin_memory = True)
             arena = (host, self._arena_views(host, rows, width, with_positions), {})
-            self.stage_arenas[key] = arena
+            tab[key] = arena
         return arena
 
 
@@ -2238,6 +2280,37 @@ class Generator:
         # position n gates position n+1, and constrained-decoding masks and sampling past IDs
         # must advance between positions.
         else:
+            def _batchable(job):
+                return (
+                    not _NO_BATCH_READBACK
+                    and job.checkpoint is None
+                    and job.forced_ids is None
+                    and job.new_tokens >= job.min_new_tokens
+                    and not any(f.is_active or f.trigger_token is not None for f in job.filters)
+                    and not job.sampler.reqs_past_ids
+                )
+            pre_st = {}
+            jobs_w = [(job, a, b) for job, a, b in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]) if a != b]
+            if _ONESYNC and len(jobs_w) > 1:
+                W_ = batch_logits.shape[1]
+                pin = getattr(self, "draft_sample_pinned_b", None)
+                if pin is None or pin.shape[0] < len(jobs_w) or pin.shape[1] < W_:
+                    pin = torch.empty((max(8, len(jobs_w)), max(W_, 8)), dtype = torch.long, pin_memory = True)
+                    self.draft_sample_pinned_b = pin
+                for k, (job, a, b) in enumerate(jobs_w):
+                    if b - a != 1 or not _batchable(job):
+                        continue
+                    rng_state_k = job.rng.getstate()
+                    staged_k = []
+                    for i in range(W_):
+                        sampled = job.receive_logits(batch_logits[a:b, i:i + 1, :])
+                        if sampled[0].is_cuda and sampled[0].numel() == 1:
+                            pin[k:k + 1, i:i + 1].copy_(sampled[0].view(1, 1), non_blocking = True)
+                            sampled = (pin[k:k + 1, i:i + 1],) + sampled[1:]
+                        staged_k.append((sampled, False))
+                    pre_st[id(job)] = (staged_k, rng_state_k)
+                if pre_st:
+                    torch.cuda.synchronize(batch_logits.device)
             for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
                 if a == b: continue
                 job_logits = batch_logits[a:b, :, :]
@@ -2266,7 +2339,9 @@ class Generator:
                     and not job.sampler.reqs_past_ids
                 )
                 staged = None
-                if batchable:
+                if id(job) in pre_st:
+                    staged, rng_state = pre_st[id(job)]
+                elif batchable:
                     rng_state = job.rng.getstate()
                     staged = []
                     any_cuda = False

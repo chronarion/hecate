@@ -2,7 +2,7 @@
 
 Hecate serves **GLM-5.3 (753B MoE)** on a single **NVIDIA DGX Station GB300** at concurrency-1 decode speeds of
 **144-212 tok/s** on realistic sampled workloads and **~176 tok/s** on short greedy prompts (stock model, MTP
-speculative decoding, 2 × 256K context). Its KL divergence to the BF16 model is lower
+speculative decoding, 2 × 256K context), and ~290 tok/s in total across 8 conversations. Its KL divergence to the BF16 model is lower
 than the published 3-bit EXL3 quant's.
 
 The model does not fit in any one memory of the machine. Hecate splits every MoE layer across all three processors at
@@ -24,7 +24,8 @@ release, [zai-org/GLM-5.3-BF16](https://huggingface.co/zai-org/GLM-5.3-BF16).
 |---|---|
 | Decode, concurrency 1, realistic workloads (temperature 1) | **144-212 tok/s** by workload (table below) |
 | Decode, concurrency 1, 10 prompts, greedy, 400 tokens | **~176 tok/s** (stock; 172-179 over 6 server restarts; 1.8: ~181) |
-| Decode vs context (llm-inference-bench, C=1) | 16K: 152 · 32K: 156 · 64K: 150 · 128K: 146 tok/s |
+| Decode vs context (llm-inference-bench, C=1) | 16K: 139 · 32K: 133 · 64K: 134 · 128K: 131 tok/s (counted from per-chunk usage since 1.10, see below) |
+| Decode, several conversations (llm-inference-bench, total) | 2: 179 · 4: 244 · 8: 292 tok/s at short context; 2: 188 · 4: 243 · 8: 283 at 16K |
 | One long prompt, then 300 tokens of decode (release 1.8, mean of 2 runs) | 27K: 4,648 tok/s prefill, 163 tok/s decode · 109K: 4,712 / 158 |
 | Prefill (llm-inference-bench standalone, cold) | ~4,800 tok/s at 8K-32K, 4,750 at 64K, 4,600 at 128K; time to first token 0.3 s at 1K |
 | KL divergence vs BF16 (rtx6kpro protocol, 36,848 positions) | **0.0734** (published EXL3 3.0 bpw: 0.1013) |
@@ -37,26 +38,42 @@ the default 512K-token KV pool (cells that would not fit in it are skipped). The
 so the server samples at TabbyAPI's default of 1.0 (our own speed test is greedy). Raw JSON and logs:
 [`benchmarks/`](benchmarks/), invocations in [`tools/bench/llm_inference_bench.sh`](tools/bench/llm_inference_bench.sh).
 
-**Decode, aggregate tok/s by context and concurrency** (release 1.9; mean of the runs that measured the cell):
+**Decode, total tok/s by context and concurrency** (release 1.10):
 
 | Context | C=1 | C=2 | C=4 | C=8 | C=16 | C=32 |
 |---|---:|---:|---:|---:|---:|---:|
-| 0 | 168 | 209 | 117 | 247 | 8 run + 8 queue | 8 run + 24 queue |
-| 4K | 148 | 185 | 117 | 251 | - | - |
-| 16K | 152 | 182 | 113 | 246 | - | - |
-| 32K | 156 | 172 | 115 | 247 | - | - |
-| 64K | 150 | 181 | 114 | - | - | - |
-| 128K | 146 | 172 | - | - | - | - |
+| 0 | 140 | 179 | 244 | 292 | 293 (8 running, 8 queued) | 297 (8 running, 24 queued) |
+| 4K | 132 | 187 | 249 | 293 | - | - |
+| 16K | 136 | 188 | 243 | 283 | - | - |
+| 32K | 131 | 187 | 245 | 284 | - | - |
+| 64K | 131 | 186 | 237 | - | - | - |
+| 128K | 127 | 178 | - | - | - | - |
 
-Each request gets the aggregate divided by C. Hecate is tuned for a few conversations: at most 8 requests decode at
-once (`HECATE_MAX_BATCH`) and later ones wait in the queue, then run at full speed: at C=16 each request decoded at ~31
-tok/s once it started, ~250 tok/s in aggregate, after waiting ~37 s on average for a slot (the benchmark's own aggregate
-for queued cells is not meaningful). MTP drafts take rows too: 4 concurrent requests get one draft each, 8 none.
+Each request gets the total divided by C. At most 8 requests decode at once (`HECATE_MAX_BATCH`); later ones wait in
+the queue and then run at full speed. MTP drafts take rows too: 4 concurrent requests get one draft each, 8 none.
 Streamed requests start ahead of non-streamed ones (docs/configuration.md, "Concurrency"). Single C=1 cells vary by up
-to ±10% between runs, because MTP acceptance depends on the generated text; on this benchmark 1.9 and 1.8 measured the
-same at C=1 in one session (the 1.9 gains show on the workloads below).
+to ±10% between runs, because MTP acceptance depends on the generated text.
 
-On our short greedy test 1.9 is ~3% slower than 1.8 (~176 vs ~181 tok/s, means over 6 and 3 server restarts; a single
+The benchmark counts tokens from the usage numbers a server attaches to every streamed chunk (vLLM's
+`stream_options.continuous_usage_stats`). TabbyAPI sent usage only at the end of a request, so until 1.9 the benchmark
+credited a finished request's whole output when it ended (C=1 and C=2 read ~15-20% high) and fell back to counting
+chunks when no request finished inside its 30 s window (C=4 read half its real value: one chunk holds a whole MTP step).
+Hecate sends per-chunk usage since 1.10, so these numbers are comparable with other servers' but not with the tables of
+earlier releases. Compare releases with the same-session numbers below.
+
+**Several conversations, 1.9 vs 1.10 in one session** (each request's own decode speed, tok/s, streamed requests):
+
+| Conversations | short prompt, 1.9 | 1.10 | ~16K-token context, 1.9 | 1.10 |
+|---|---:|---:|---:|---:|
+| 2 | 90 | 97 | 81 | 98 |
+| 4 | 57 | 65 | 54 | 64 |
+| 8 | 30 | 36 | 32 | 37 |
+
+Under overload (`tools/bench/overload_check.py`: 48 batch requests and a streamed request every 45 s) the running batch
+requests decode at 43 tok/s (1.9: 35) and streamed requests get their first token within 0.3 s; with 24 batch requests
+carrying unique 30K-token prompts, streamed requests get their first token within 2.3 s (1.9: up to 38 s).
+
+On our short greedy test 1.9 was ~3% slower than 1.8 (~176 vs ~181 tok/s, means over 6 and 3 server restarts; a single
 restart moves it by ±3%). Switching the new drafts or the request scheduling off does not change it. About 1% comes from
 the new expert placement, which is ranked for real traffic rather than for this test (1.9 with the old placement: ~178);
 the rest is likely the Grace band fix, which now computes experts that were skipped before.
@@ -138,6 +155,15 @@ credits public work the change builds on; "—" means it came out of profiling t
 | Copy drafts (1.9) | when the newest 16 tokens repeat earlier text (a tool call writing back a file it read, an edited file, a quoted document), the step checks up to 7 tokens copied from there instead of the 3 model drafts; ExLlamaV3's suffix automaton finds the match | +22% on file-writing and editing turns; no change elsewhere | [SuffixDecoding](https://arxiv.org/abs/2411.04975), prompt lookup decoding |
 | Expert placement from real requests (1.9) | which int4 experts sit in GPU memory and which on the Grace CPU is now ranked from ~30K decode steps of reasoning, code, long-context, tool-use, editing and chat requests (the old ranking came from 24 short prompts and sent experts that code uses often to the CPU) | +4% on reasoning / code / chat, +16% on agent and editing turns | activation-aware expert placement (MoE-Infinity) |
 | Smaller wins | token embedding in HBM (removes a host sync per draft), int4 draft LM head, MTP layer in int4, fused shared-expert gate + up + SiLU, shared expert straight into the hot-tier accumulator | +1-3% each | int4 draft-only LM head: [b12x](https://github.com/local-inference-lab/b12x) |
+
+Since 1.10, for several conversations at once (decode step time, same session as the build before it):
+
+| Change | What it does | Gain | Idea from |
+|---|---|---|---|
+| Wider attention blocks for batches | decode attention with several requests (contexts under 2,048 tokens) gives each program 16 (row, head) pairs, as one request's verify step has, instead of 4 heads of one row: 4x fewer programs re-reading the same cached keys | 15-20% at 5-8 requests and 1-2K tokens | — |
+| Sparse attention kernel for batches | the tcgen05 sparse attention (contexts above 2,048 tokens) ran one request only; a batch now runs through it, each row reading its own request's block table (bit-identical per row) | 10% at 2-8 requests and ~16K tokens | — |
+| CUDA graphs for batch steps | decode steps of 2-8 requests and the MTP draft passes of 2-4 requests replay from graphs; all requests' samplers launch before one readback | 3-5% at 2-4 requests, 2-4% at 6-8 | full-forward graphs in vLLM / SGLang |
+| Interactive-first scheduling | prompts are read one chunk per pass, interactive ones first; agents keep 80% of the GPU while batch prompts are read | agents' first token under a long-prompt flood: 38 s → 2 s | priority scheduling of real-time and best-effort requests ([BROS](https://arxiv.org/abs/2504.09590)) |
 
 **Fidelity.** These changes made the model closer to BF16 than the published 3-bit quant, not just faster:
 - the int4 tiers are GPTQ-requantized from BF16, calibrated on the states of the quantized model, layer by layer;

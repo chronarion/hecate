@@ -12,6 +12,7 @@ _CANCELLED_SENTINEL = object()
 
 _LONG_STEP = float(_os.environ.get("EXL3_LONG_STEP_S", "0.2"))
 _LONG_YIELD = float(_os.environ.get("EXL3_LONG_STEP_YIELD_S", "0.02"))
+_LONG_DRAIN = float(_os.environ.get("EXL3_LONG_STEP_DRAIN_S", "0.25"))
 
 
 class AsyncGenerator:
@@ -58,6 +59,16 @@ class AsyncGenerator:
                 # After a long step, give the loop a short real sleep so queued requests reach enqueue()
                 if _time.perf_counter() - _t_it > _LONG_STEP:
                     await asyncio.sleep(_LONG_YIELD)
+                    # then keep yielding while the loop has work (a turn that takes > 0.5 ms ran callbacks: requests being
+                    # parsed, templated and tokenized), up to EXL3_LONG_STEP_DRAIN_S: with many long prompts arriving at
+                    # once a 20 ms window fits about one tokenization, and a short request queued behind the rest waited
+                    # one long step per window
+                    _t_end = _time.perf_counter() + _LONG_DRAIN
+                    while _time.perf_counter() < _t_end:
+                        _t_y = _time.perf_counter()
+                        await asyncio.sleep(0)
+                        if _time.perf_counter() - _t_y < 0.0005:
+                            break
 
                 # Yield back to the event loop so result consumers and cancellation requests can run between
                 # generator iterations, even if the synchronous generator immediately has more work available.
